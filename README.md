@@ -2,7 +2,7 @@
 
 Rust replacement for the Python `ssh-mcp-server` fork. Async (tokio + axum + russh),
 pooled/multiplexed SSH, sync **and** async command execution, Streamable HTTP for both
-MCP eras. ~1.4k lines, single static-ish binary, ~10 MB idle / ~40 MB under 1000 concurrent runs.
+MCP eras. ~2.2k lines of Rust, one binary; ~42 MB RSS after 1000 concurrent runs.
 
 ## Why it's better than the old server
 
