@@ -137,16 +137,22 @@ pub fn definitions(app: &AppState) -> Vec<Value> {
         json!({
             "name": "edit_file",
             "title": "Edit file",
-            "description": "Edit a text file on a host by exact string replacement. old_string must match exactly once (whitespace and indentation included) unless replace_all=true; zero or multiple matches change nothing and the error says why. Edits in place (keeps inode, owner and permissions — safe for bind-mounted files), and refuses to write if the file changed between read and write. Returns numbered context around each change. Text files up to 4 MiB; use write_file to create or fully replace a file.",
+            "description": "Edit a text file on a host by exact string replacement. Either one edit (old_string/new_string) or an `edits` list applied in order — each edit sees the result of the previous ones — and ALL-OR-NOTHING: if any edit fails, nothing is written and the error names which edit. Each old_string must match exactly once (whitespace and indentation included) unless that edit sets replace_all. Edits in place (keeps inode, owner and permissions — safe for bind-mounted files), and refuses to write if the file changed between read and write. Returns numbered context around each change. Text files up to 4 MiB, up to 200 edits per call; use write_file to create or fully replace a file.",
             "inputSchema": {"type": "object", "properties": {
                 "hostname": {"type": "string", "description": host_desc},
                 "path": {"type": "string", "description": "Absolute path."},
-                "old_string": {"type": "string", "description": "Exact text to replace. Include enough surrounding lines to make it unique."},
-                "new_string": {"type": "string", "description": "Replacement text (may be empty to delete)."},
-                "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one."},
+                "old_string": {"type": "string", "description": "Single-edit form: exact text to replace. Include enough surrounding lines to make it unique."},
+                "new_string": {"type": "string", "description": "Single-edit form: replacement text (may be empty to delete)."},
+                "replace_all": {"type": "boolean", "description": "Single-edit form: replace every occurrence instead of requiring exactly one."},
+                "edits": {"type": "array", "maxItems": 200, "description": "Multi-edit form (use instead of old_string/new_string): applied in order, all-or-nothing.",
+                    "items": {"type": "object", "properties": {
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                        "replace_all": {"type": "boolean"}
+                    }, "required": ["old_string", "new_string"]}},
                 "sudo": {"type": "boolean", "description": "Edit as root."},
                 "username": {"type": "string", "description": user_desc}
-            }, "required": ["hostname", "path", "old_string", "new_string"]},
+            }, "required": ["hostname", "path"]},
             "annotations": {"destructiveHint": true, "openWorldHint": false}
         }),
         json!({

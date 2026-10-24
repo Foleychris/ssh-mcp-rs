@@ -225,14 +225,30 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
 
 // ---------------------------------------------------------------- edit_file
 
-#[derive(Deserialize)]
-pub struct EditArgs {
-    hostname: String,
-    path: String,
+const MAX_EDITS: usize = 200;
+
+#[derive(Deserialize, Clone)]
+pub struct Edit {
     old_string: String,
     new_string: String,
     #[serde(default)]
     replace_all: bool,
+}
+
+#[derive(Deserialize)]
+pub struct EditArgs {
+    hostname: String,
+    path: String,
+    /// Single-edit form.
+    #[serde(default)]
+    old_string: Option<String>,
+    #[serde(default)]
+    new_string: Option<String>,
+    #[serde(default)]
+    replace_all: bool,
+    /// Multi-edit form: applied in order, all-or-nothing.
+    #[serde(default)]
+    edits: Option<Vec<Edit>>,
     #[serde(default)]
     sudo: bool,
     #[serde(default)]
@@ -258,6 +274,78 @@ fn context(text: &str, start: usize, end: usize, around: usize) -> String {
     out
 }
 
+/// A replaced region in the FINAL text: (start, end, 1-based edit number).
+type Span = (usize, usize, usize);
+
+/// Apply edits in order to `text`. Each edit sees the result of the previous
+/// ones. Any failure aborts the whole batch (nothing is written). Returns the
+/// new text, the replaced regions in final-text coordinates, and the total
+/// number of replacements.
+fn apply_edits(text: &str, edits: &[Edit]) -> Result<(String, Vec<Span>, usize), String> {
+    let n = edits.len();
+    let label = |k: usize| if n == 1 { String::new() } else { format!("edit {} of {n}: ", k + 1) };
+    let mut cur = text.to_string();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut total = 0;
+    for (k, e) in edits.iter().enumerate() {
+        if e.old_string.is_empty() {
+            return Err(format!("{}old_string is empty (use write_file to create or overwrite a file)", label(k)));
+        }
+        if e.old_string == e.new_string {
+            return Err(format!("{}old_string and new_string are identical", label(k)));
+        }
+        let hits: Vec<usize> = cur.match_indices(&e.old_string).map(|(i, _)| i).collect();
+        if hits.is_empty() {
+            let hint = if cur.contains(e.old_string.trim()) {
+                " (it does match after trimming leading/trailing whitespace — check indentation and line endings)"
+            } else if cur.contains("\r\n") && e.old_string.contains('\n') && !e.old_string.contains("\r\n") {
+                " (the file uses CRLF line endings)"
+            } else if k > 0 && text.contains(&e.old_string) {
+                " (it matched the original file, but an earlier edit in this batch changed that text — edits apply in order)"
+            } else {
+                ""
+            };
+            return Err(format!("{}old_string not found{hint}", label(k)));
+        }
+        if hits.len() > 1 && !e.replace_all {
+            let lines: Vec<String> = hits.iter().take(10).map(|&i| line_of(&cur, i).to_string()).collect();
+            return Err(format!(
+                "{}old_string matches {} times (lines {}{}); add surrounding context to make it unique, or set replace_all",
+                label(k),
+                hits.len(),
+                lines.join(", "),
+                if hits.len() > 10 { ", …" } else { "" }
+            ));
+        }
+        let (ol, nl) = (e.old_string.len(), e.new_string.len());
+        // Earlier spans: drop any that this edit overwrote, shift the rest.
+        spans.retain(|&(s, en, _)| !hits.iter().any(|&h| s < h + ol && h < en.max(s + 1)));
+        for sp in spans.iter_mut() {
+            let before = hits.iter().filter(|&&h| h + ol <= sp.0).count();
+            let d = nl as isize - ol as isize;
+            sp.0 = (sp.0 as isize + d * before as isize) as usize;
+            sp.1 = (sp.1 as isize + d * before as isize) as usize;
+        }
+        let mut next = String::with_capacity(cur.len() + nl * hits.len());
+        let mut last = 0;
+        for &i in &hits {
+            next.push_str(&cur[last..i]);
+            let s = next.len();
+            next.push_str(&e.new_string);
+            spans.push((s, next.len(), k + 1));
+            last = i + ol;
+        }
+        next.push_str(&cur[last..]);
+        total += hits.len();
+        cur = next;
+    }
+    if cur == text {
+        return Err("the edits leave the file unchanged".into());
+    }
+    spans.sort();
+    Ok((cur, spans, total))
+}
+
 pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
     let a: EditArgs = match parse(args) {
         Ok(a) => a,
@@ -270,11 +358,17 @@ pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
     if let Err(e) = check_path(&a.path) {
         return e;
     }
-    if a.old_string.is_empty() {
-        return err("old_string is empty (use write_file to create or overwrite a file)");
+    let edits: Vec<Edit> = match (a.edits, a.old_string, a.new_string) {
+        (Some(list), None, None) => list,
+        (None, Some(o), Some(n)) => vec![Edit { old_string: o, new_string: n, replace_all: a.replace_all }],
+        (Some(_), _, _) => return err("pass either `edits` or `old_string`/`new_string`, not both"),
+        _ => return err("pass `old_string` and `new_string`, or an `edits` list"),
+    };
+    if edits.is_empty() {
+        return err("`edits` is empty");
     }
-    if a.old_string == a.new_string {
-        return err("old_string and new_string are identical; nothing to do");
+    if edits.len() > MAX_EDITS {
+        return err(format!("too many edits in one call ({}; max {MAX_EDITS})", edits.len()));
     }
     let p = sh_quote(&a.path);
 
@@ -304,44 +398,14 @@ pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         return err("edit: file contains NUL bytes (binary); edit_file only edits text files");
     }
 
-    // 2. Locate matches.
-    let hits: Vec<usize> = text.match_indices(&a.old_string).map(|(i, _)| i).collect();
-    if hits.is_empty() {
-        let hint = if text.contains(a.old_string.trim()) {
-            " (it does match after trimming leading/trailing whitespace — check indentation and line endings)"
-        } else if text.contains("\r\n") && a.old_string.contains('\n') && !a.old_string.contains("\r\n") {
-            " (the file uses CRLF line endings)"
-        } else {
-            ""
-        };
-        return err(format!("edit: old_string not found in {}{hint}. Nothing was changed.", a.path));
-    }
-    if hits.len() > 1 && !a.replace_all {
-        let lines: Vec<String> = hits.iter().take(10).map(|&i| line_of(&text, i).to_string()).collect();
-        return err(format!(
-            "edit: old_string matches {} times (lines {}{}). Add surrounding context to make it unique, or pass replace_all=true. Nothing was changed.",
-            hits.len(),
-            lines.join(", "),
-            if hits.len() > 10 { ", …" } else { "" }
-        ));
-    }
-
-    // 3. Build the new content, remembering where each replacement landed.
-    let mut out = String::with_capacity(text.len() + a.new_string.len() * hits.len());
-    let mut spans = Vec::new();
-    let mut last = 0;
-    for &i in &hits {
-        out.push_str(&text[last..i]);
-        let s = out.len();
-        out.push_str(&a.new_string);
-        spans.push((s, out.len()));
-        last = i + a.old_string.len();
-    }
-    out.push_str(&text[last..]);
+    // 2. Apply every edit in memory; any failure means nothing is written.
+    let (out, spans, total) = match apply_edits(&text, &edits) {
+        Ok(v) => v,
+        Err(e) => return err(format!("edit: {e}. Nothing was changed in {}.", a.path)),
+    };
     let expected = out.len();
 
-    // 4. Write back in place (keeps inode, owner, mode) iff unchanged since the read.
-    // Stage the upload in a temp file and check it arrived complete before the
+    // 3. Stage the upload in a temp file and check it arrived complete before the
     // target is touched; only then re-check the guard and copy in place
     // (`cat tmp > file` keeps the target's inode, owner and mode).
     let write_cmd = format!(
@@ -365,18 +429,86 @@ pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         None => "could not verify size".to_string(),
     };
     let mut t = format!(
-        "[{}] {}: replaced {} occurrence{} — file now {} bytes ({verdict})",
+        "[{}] {}: {} edit{}, {} replacement{} — file now {} bytes ({verdict})",
         wrun.target.alias,
         a.path,
-        hits.len(),
-        if hits.len() == 1 { "" } else { "s" },
+        edits.len(),
+        if edits.len() == 1 { "" } else { "s" },
+        total,
+        if total == 1 { "" } else { "s" },
         on_disk.map(|n| n.to_string()).unwrap_or("?".into())
     );
-    for (k, &(s, e)) in spans.iter().take(3).enumerate() {
-        let _ = write!(t, "\n--- change {} ---\n{}", k + 1, context(&out, s, e.saturating_sub(1).max(s), 2).trim_end());
+    const SHOW: usize = 5;
+    for &(s, e, k) in spans.iter().take(SHOW) {
+        let tag = if edits.len() == 1 { String::new() } else { format!(" (edit {k})") };
+        let _ = write!(t, "\n--- line {}{tag} ---\n{}", line_of(&out, s), context(&out, s, e.saturating_sub(1).max(s), 2).trim_end());
     }
-    if spans.len() > 3 {
-        let _ = write!(t, "\n… and {} more", spans.len() - 3);
+    if spans.len() > SHOW {
+        let _ = write!(t, "\n… and {} more change{}", spans.len() - SHOW, if spans.len() - SHOW == 1 { "" } else { "s" });
     }
     ok(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn e(o: &str, n: &str) -> Edit {
+        Edit { old_string: o.into(), new_string: n.into(), replace_all: false }
+    }
+
+    #[test]
+    fn sequential_and_spans_shift() {
+        let (out, spans, total) = apply_edits("a\nb\nc\n", &[e("c", "CCC"), e("a", "AAAA")]).unwrap();
+        assert_eq!(out, "AAAA\nb\nCCC\n");
+        assert_eq!(total, 2);
+        // spans are in final coordinates, sorted
+        assert_eq!(&out[spans[0].0..spans[0].1], "AAAA");
+        assert_eq!(&out[spans[1].0..spans[1].1], "CCC");
+    }
+
+    #[test]
+    fn later_edit_sees_earlier_result() {
+        let (out, _, _) = apply_edits("x=1", &[e("x=1", "x=2"), e("x=2", "x=3")]).unwrap();
+        assert_eq!(out, "x=3");
+    }
+
+    #[test]
+    fn failure_is_all_or_nothing_and_names_the_edit() {
+        let r = apply_edits("a b", &[e("a", "A"), e("zzz", "Z")]);
+        assert!(r.unwrap_err().starts_with("edit 2 of 2: old_string not found"));
+    }
+
+    #[test]
+    fn hint_when_earlier_edit_consumed_text() {
+        let r = apply_edits("foo bar", &[e("foo bar", "baz"), e("bar", "qux")]).unwrap_err();
+        assert!(r.contains("earlier edit in this batch changed that text"), "{r}");
+    }
+
+    #[test]
+    fn ambiguous_without_replace_all() {
+        let r = apply_edits("p=1\np=1\n", &[e("p=1", "p=2")]).unwrap_err();
+        assert!(r.contains("matches 2 times (lines 1, 2)"), "{r}");
+        let all = Edit { replace_all: true, ..e("p=1", "p=2") };
+        assert_eq!(apply_edits("p=1\np=1\n", &[all]).unwrap().0, "p=2\np=2\n");
+    }
+
+    #[test]
+    fn overwritten_span_is_dropped() {
+        let (out, spans, _) = apply_edits("abc", &[e("b", "XYZ"), e("aXYZc", "q")]).unwrap();
+        assert_eq!(out, "q");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].2, 2);
+    }
+
+    #[test]
+    fn multibyte_context_does_not_panic() {
+        let (out, spans, _) = apply_edits("t: x\n", &[e("x", "café — 🙂")]).unwrap();
+        let s = spans[0];
+        let _ = context(&out, s.0, s.1.saturating_sub(1).max(s.0), 2);
+    }
+
+    #[test]
+    fn no_op_batch_rejected() {
+        assert!(apply_edits("ab", &[e("a", "z"), e("z", "a")]).is_err());
+    }
 }

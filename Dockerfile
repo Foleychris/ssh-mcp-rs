@@ -7,7 +7,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src target/release/deps/ssh_mcp_rs*
 COPY src ./src
-RUN cargo build --release
+# Unit tests gate the image: a failing test fails the build (and the weekly update).
+RUN cargo test --release && cargo build --release
 
 FROM debian:trixie-slim
 COPY --from=build /src/target/release/ssh-mcp-rs /usr/local/bin/ssh-mcp-rs

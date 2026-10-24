@@ -27,7 +27,7 @@ MCP eras. ~2.2k lines of Rust, one binary; ~42 MB RSS after 1000 concurrent runs
 - `list_runs(active_only?, hostname?, limit?)`, `cancel_run(run_id)`
 - `write_file(hostname, path, content, encoding?, append?, mkdirs?, mode?, sudo?, username?)`
 - `read_file(hostname, path, offset?, length?, encoding?, sudo?, username?)` — text, base64 for binary, whole PNG/JPEG/GIF/WebP ≤5 MiB as an image content block; paged, max 4 MiB/call
-- `edit_file(hostname, path, old_string, new_string, replace_all?, sudo?, username?)` — exact-string replacement; must match once unless replace_all; in place (keeps inode/owner/mode); sha256 change guard between read and write; text ≤4 MiB
+- `edit_file(hostname, path, old_string, new_string, replace_all?, sudo?, username?)` or `edit_file(hostname, path, edits=[{old_string, new_string, replace_all?}, …])` — exact-string replacement; edits apply in order, all-or-nothing (≤200 per call); each must match once unless replace_all; in place (keeps inode/owner/mode); sha256 change guard between read and write; text ≤4 MiB
 - `get_server_info`, `test_ssh_connection`, `list_hosts`
 
 Hosts come from config; unlisted hostnames/IPs
