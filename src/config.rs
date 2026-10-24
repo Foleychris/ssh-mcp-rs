@@ -81,6 +81,9 @@ pub struct Config {
     /// Optional static bearer token. Also settable via SSH_MCP_TOKEN / SSH_MCP_TOKEN_FILE.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Also accept the secret as `?key=` in the URL (for clients without custom headers).
+    #[serde(default)]
+    pub allow_query_token: bool,
     /// Origins accepted when a browser-style Origin header is present.
     #[serde(default = "d_origins")]
     pub allowed_origins: Vec<String>,

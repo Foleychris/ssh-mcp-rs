@@ -41,8 +41,10 @@ One endpoint, `POST /mcp` (`GET`/`DELETE` → 405). Era is chosen per request:
 - otherwise → **2024-11-05…2025-11-25**: `initialize` negotiates, no `Mcp-Session-Id` is minted.
 - `tools/call` answers as SSE when the client accepts it, with 15 s keep-alive comments (survives
   Cloudflare's ~100 s idle cutoff); otherwise plain JSON.
-- `Origin` validated (claude.ai / claude.com / localhost by default) → 403. Optional bearer token
-  (`auth_token`, `SSH_MCP_TOKEN`, `SSH_MCP_TOKEN_FILE`).
+- `Origin` validated (claude.ai / claude.com / localhost by default) → 403.
+- Shared secret (`auth_token` / `SSH_MCP_TOKEN` / `SSH_MCP_TOKEN_FILE`)
+  accepted as `Authorization: Bearer`, `x-api-key`, or `x-auth-token`; `?key=` only if
+  `allow_query_token = true` (fallback for clients without custom headers). Otherwise 401.
 
 Tasks extension (`io.modelcontextprotocol/tasks`) is **not** implemented: async is exposed as
 ordinary tools (run_id handle pattern), which works with every client today.

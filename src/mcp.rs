@@ -82,6 +82,35 @@ fn origin_ok(app: &AppState, origin: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1")
 }
 
+/// Shared-secret check. Accepted carriers, any one of:
+///  `Authorization: Bearer <secret>`, `x-api-key: <secret>`, `x-auth-token: <secret>`,
+///  and — only when `allow_query_token` is set — `?key=<secret>` on the URL
+///  (fallback for clients that cannot send custom headers).
+fn authorized(app: &AppState, tok: &str, uri: &axum::http::Uri, headers: &HeaderMap) -> bool {
+    let ok = |p: &str| constant_time_eq(p.trim().as_bytes(), tok.as_bytes());
+    let hv = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
+    if let Some(a) = hv("authorization") {
+        if a.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("bearer ")) && ok(&a[7..]) {
+            return true;
+        }
+    }
+    if hv("x-api-key").is_some_and(ok) || hv("x-auth-token").is_some_and(ok) {
+        return true;
+    }
+    if app.cfg.allow_query_token {
+        if let Some(q) = uri.query() {
+            for pair in q.split('&') {
+                if let Some(v) = pair.strip_prefix("key=") {
+                    if ok(v) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Decode the `=?base64?…?=` sentinel form used by Mcp-Name / Mcp-Param-*.
 fn decode_header_value(v: &str) -> Option<String> {
     match v.strip_prefix("=?base64?").and_then(|r| r.strip_suffix("?=")) {
@@ -93,14 +122,15 @@ fn decode_header_value(v: &str) -> Option<String> {
     }
 }
 
-pub async fn handle(State(app): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn handle(
+    State(app): State<Arc<AppState>>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     if let Some(tok) = &app.cfg.auth_token {
-        let presented = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
-            .map(str::trim);
-        if !presented.is_some_and(|p| constant_time_eq(p.as_bytes(), tok.as_bytes())) {
+        if !authorized(&app, tok, &uri, &headers) {
+            info!("rejected request: missing or wrong shared secret");
             return (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Bearer")],
