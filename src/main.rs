@@ -1,4 +1,5 @@
 mod config;
+mod fileops;
 mod mcp;
 mod runs;
 mod ssh;

@@ -374,7 +374,11 @@ async fn tools_call(
     let finish = move |res: Result<Option<tools::ToolOut>, tokio::task::JoinError>| -> Value {
         match res {
             Ok(Some(o)) => {
-                let r = json!({"content": [{"type": "text", "text": o.text}], "isError": o.is_error});
+                let mut content = vec![json!({"type": "text", "text": o.text})];
+                if let Some((mime, data)) = o.image {
+                    content.push(json!({"type": "image", "mimeType": mime, "data": data}));
+                }
+                let r = json!({"content": content, "isError": o.is_error});
                 rpc_ok(&id2, if modern { complete(r) } else { r })
             }
             Ok(None) => rpc_err(&id2, E_PARAMS, "Unknown tool", None),

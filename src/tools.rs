@@ -12,13 +12,15 @@ use std::time::Duration;
 pub struct ToolOut {
     pub text: String,
     pub is_error: bool,
+    /// Optional image content block: (mime type, base64 data).
+    pub image: Option<(String, String)>,
 }
 
-fn ok(text: String) -> ToolOut {
-    ToolOut { text, is_error: false }
+pub fn ok(text: String) -> ToolOut {
+    ToolOut { text, is_error: false, image: None }
 }
-fn err(text: impl Into<String>) -> ToolOut {
-    ToolOut { text: text.into(), is_error: true }
+pub fn err(text: impl Into<String>) -> ToolOut {
+    ToolOut { text: text.into(), is_error: true, image: None }
 }
 
 pub fn definitions(app: &AppState) -> Vec<Value> {
@@ -120,7 +122,7 @@ pub fn definitions(app: &AppState) -> Vec<Value> {
         json!({
             "name": "read_file",
             "title": "Read file",
-            "description": "Read a file on a host, binary-safe. Returns text when the bytes are valid UTF-8 (no NULs), otherwise base64 (force either with encoding). Reads up to `length` bytes from `offset` (default 256 KiB from 0, max 4 MiB per call); the header gives the file size, mode, owner, mtime and next_offset for paging. Use instead of `cat` for large or binary files.",
+            "description": "Read a file on a host, binary-safe. Returns text when the bytes are valid UTF-8 (no NULs); a whole PNG/JPEG/GIF/WebP image up to 5 MiB is returned as an image you can see; anything else as base64 (force text or base64 with encoding). Reads up to `length` bytes from `offset` (default 256 KiB from 0, max 4 MiB per call); the header gives the file size, mode, owner, mtime and next_offset for paging. Use instead of `cat` for large or binary files.",
             "inputSchema": {"type": "object", "properties": {
                 "hostname": {"type": "string", "description": host_desc},
                 "path": {"type": "string", "description": "Absolute path."},
@@ -131,6 +133,21 @@ pub fn definitions(app: &AppState) -> Vec<Value> {
                 "username": {"type": "string", "description": user_desc}
             }, "required": ["hostname", "path"]},
             "annotations": {"readOnlyHint": true, "openWorldHint": false}
+        }),
+        json!({
+            "name": "edit_file",
+            "title": "Edit file",
+            "description": "Edit a text file on a host by exact string replacement. old_string must match exactly once (whitespace and indentation included) unless replace_all=true; zero or multiple matches change nothing and the error says why. Edits in place (keeps inode, owner and permissions — safe for bind-mounted files), and refuses to write if the file changed between read and write. Returns numbered context around each change. Text files up to 4 MiB; use write_file to create or fully replace a file.",
+            "inputSchema": {"type": "object", "properties": {
+                "hostname": {"type": "string", "description": host_desc},
+                "path": {"type": "string", "description": "Absolute path."},
+                "old_string": {"type": "string", "description": "Exact text to replace. Include enough surrounding lines to make it unique."},
+                "new_string": {"type": "string", "description": "Replacement text (may be empty to delete)."},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one."},
+                "sudo": {"type": "boolean", "description": "Edit as root."},
+                "username": {"type": "string", "description": user_desc}
+            }, "required": ["hostname", "path", "old_string", "new_string"]},
+            "annotations": {"destructiveHint": true, "openWorldHint": false}
         }),
         json!({
             "name": "get_server_info",
@@ -170,7 +187,8 @@ pub async fn call(app: &Arc<AppState>, name: &str, args: Value) -> Option<ToolOu
         "list_runs" => list_runs(app, args),
         "cancel_run" => cancel_run(app, args).await,
         "write_file" => write_file(app, args).await,
-        "read_file" => read_file(app, args).await,
+        "read_file" => crate::fileops::read_file(app, args).await,
+        "edit_file" => crate::fileops::edit_file(app, args).await,
         "get_server_info" => server_info(app, args).await,
         "test_ssh_connection" => test_conn(app, args).await,
         "list_hosts" => list_hosts(app),
@@ -178,13 +196,13 @@ pub async fn call(app: &Arc<AppState>, name: &str, args: Value) -> Option<ToolOu
     })
 }
 
-fn parse<T: for<'de> Deserialize<'de>>(v: Value) -> Result<T, ToolOut> {
+pub fn parse<T: for<'de> Deserialize<'de>>(v: Value) -> Result<T, ToolOut> {
     serde_json::from_value(v).map_err(|e| err(format!("invalid arguments: {e}")))
 }
 
 // ---------------------------------------------------------------- rendering
 
-fn status_line(run: &Run) -> String {
+pub fn status_line(run: &Run) -> String {
     let s = run.state();
     let mut out = match s.status {
         Status::Queued => "queued (waiting for a free execution slot)".to_string(),
@@ -342,7 +360,7 @@ async fn execute_command(app: &Arc<AppState>, args: Value) -> ToolOut {
     let wait = a.wait_secs.unwrap_or(l.default_wait_secs).min(l.max_wait_secs);
     run.wait(Duration::from_secs(wait)).await;
     let failed = matches!(run.state().status, Status::Failed);
-    ToolOut { text: render(app, &run, false), is_error: failed }
+    ToolOut { text: render(app, &run, false), is_error: failed, image: None }
 }
 
 // ---------------------------------------------------------------- runs
@@ -556,107 +574,6 @@ async fn write_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         a.path,
         on_disk.map(|n| n.to_string()).unwrap_or("?".into())
     ))
-}
-
-#[derive(Deserialize)]
-struct ReadArgs {
-    hostname: String,
-    path: String,
-    #[serde(default)]
-    offset: u64,
-    #[serde(default)]
-    length: Option<u64>,
-    #[serde(default)]
-    encoding: Option<String>,
-    #[serde(default)]
-    sudo: bool,
-    #[serde(default)]
-    username: Option<String>,
-}
-
-const READ_MAX: u64 = 4 * 1024 * 1024;
-
-async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
-    let a: ReadArgs = match parse(args) {
-        Ok(a) => a,
-        Err(e) => return e,
-    };
-    let target = match app.pool.resolve(&a.hostname, a.username.as_deref()) {
-        Ok(t) => t,
-        Err(e) => return err(format!("{e:#}")),
-    };
-    if a.path.trim().is_empty() {
-        return err("path is empty");
-    }
-    let enc = a.encoding.as_deref().unwrap_or("auto");
-    if !matches!(enc, "auto" | "utf8" | "utf-8" | "base64") {
-        return err(format!("unknown encoding '{enc}'"));
-    }
-    let len = a.length.unwrap_or(256 * 1024).clamp(1, READ_MAX);
-    let p = sh_quote(&a.path);
-    // Metadata goes to stderr as one line, the requested byte range to stdout.
-    // Works with GNU coreutils and busybox. `tail -c +N` is 1-based.
-    let cmd = format!(
-        "set -e; [ -e {p} ] || {{ echo 'no such file' >&2; exit 2; }}; [ -d {p} ] && {{ echo 'is a directory' >&2; exit 3; }}; \
-         [ -r {p} ] || {{ echo 'permission denied (try sudo=true)' >&2; exit 4; }}; \
-         echo \"META $(stat -L -c '%s|%A|%U:%G|%y' -- {p} 2>/dev/null || wc -c < {p})\" >&2; \
-         tail -c +{} -- {p} | head -c {len}",
-        a.offset + 1
-    );
-    let run = app.runs.start(
-        target,
-        cmd,
-        StartOpts { sudo: a.sudo, stdin: None, timeout: Some(Duration::from_secs(120)) },
-    );
-    run.wait(Duration::from_secs(130)).await;
-    let s = run.state();
-    let errs = String::from_utf8_lossy(s.stderr.read_from(0, 8192).1).to_string();
-    if s.status != Status::Exited || s.exit_code != Some(0) {
-        drop(s);
-        let why = errs.lines().find(|l| !l.starts_with("META ")).unwrap_or("").trim().to_string();
-        return err(format!("[{}] read failed: {} {}", run.target.alias, status_line(&run), why));
-    }
-    let meta = errs.lines().find_map(|l| l.strip_prefix("META ")).unwrap_or("").trim().to_string();
-    let mut f = meta.split('|');
-    let size: Option<u64> = f.next().and_then(|v| v.trim().parse().ok());
-    let rest: Vec<&str> = f.collect();
-    let data = s.stdout.read_from(0, len as usize).1.to_vec();
-    drop(s);
-    let n = data.len() as u64;
-    let next = a.offset + n;
-    let eof = size.is_none_or(|sz| next >= sz);
-    let as_text = match enc {
-        "base64" => None,
-        "utf8" | "utf-8" => Some(String::from_utf8_lossy(&data).into_owned()),
-        _ => std::str::from_utf8(&data).ok().filter(|t| !t.contains('\0')).map(str::to_string),
-    };
-    let mut t = format!(
-        "[{}] {} — bytes {}..{} of {}{}",
-        run.target.alias,
-        a.path,
-        a.offset,
-        next,
-        size.map(|v| v.to_string()).unwrap_or("?".into()),
-        if eof { " (EOF)".to_string() } else { format!(" (next_offset={next})") }
-    );
-    if !rest.is_empty() {
-        let _ = write!(t, "\n{}", rest.join("  "));
-    }
-    match as_text {
-        Some(txt) => {
-            // A cut at `length` may split a UTF-8 sequence; auto mode then falls back to base64.
-            let _ = write!(t, "\n--- utf8 ---\n{txt}");
-        }
-        None => {
-            let _ = write!(
-                t,
-                "\n--- base64 ({n} bytes{}) ---\n{}",
-                if enc == "auto" { "; not valid UTF-8 text" } else { "" },
-                base64::engine::general_purpose::STANDARD.encode(&data)
-            );
-        }
-    }
-    ok(t)
 }
 
 // ---------------------------------------------------------------- host info
