@@ -1,0 +1,56 @@
+# ssh-mcp-rs
+
+Rust replacement for the Python `ssh-mcp-server` fork. Async (tokio + axum + russh),
+pooled/multiplexed SSH, sync **and** async command execution, Streamable HTTP for both
+MCP eras. ~1.4k lines, single static-ish binary, ~10 MB idle / ~40 MB under 1000 concurrent runs.
+
+## Why it's better than the old server
+
+| Old (Python/paramiko) | New |
+|---|---|
+| New TCP+SSH handshake per call (~100 ms–5 s) | Pooled connections; 6 channels multiplexed per connection, up to 6 connections per host (36 concurrent commands/host), queueing beyond that |
+| Blocking: long commands die on the ~120 s timeout | Sync calls wait `wait_secs` (default 90) then hand back a `run_id` — the command keeps running |
+| No async | `background=true` → `run_id` immediately; `get_run` long-polls (`wait_secs`) and pages output by byte offset |
+| stdin left open (`cat` hangs forever) | stdin closed immediately, or fed from the `stdin` arg |
+| `use_sudo` pipes a password → broken with passwordless sudo | `sudo=true` → `sudo -n` (old `use_sudo` name still accepted) |
+| No cancel / timeout | `cancel_run` and `timeout_secs`: SIGTERM to the whole remote process group, SIGKILL after 5 s |
+| `AutoAddPolicy` (accepts any host key) | Verifies against `~/.ssh/known_hosts`; trust-on-first-use into a separate learned file; **changed keys are refused** |
+| `cmd &` hangs the call | Detects exit + held-open pipe, detaches after 2 s with a note |
+| Whole output inline | Head+tail view (48 KiB/stream inline); 8 MiB/stream retained for paging |
+| Heredoc file writes, quoting pain | `write_file` streams content over stdin, binary-safe (base64), verifies size on disk |
+| Stateful-only Streamable HTTP | 2026-07-28 stateless (`server/discover`, header validation) **and** legacy `initialize` clients, both stateless |
+
+## Tools
+
+- `execute_command(command, hostname, username?, sudo?, stdin?, background?, wait_secs?, timeout_secs?, confirm?)`
+- `get_run(run_id, wait_secs?, stdout_offset?, stderr_offset?, max_bytes?)`
+- `list_runs(active_only?, hostname?, limit?)`, `cancel_run(run_id)`
+- `write_file(hostname, path, content, encoding?, append?, mkdirs?, mode?, sudo?, username?)`
+- `get_server_info`, `test_ssh_connection`, `list_hosts`
+
+Hosts come from config; unlisted hostnames/IPs
+are allowed (`allow_unlisted_hosts`).
+
+## Protocol
+
+One endpoint, `POST /mcp` (`GET`/`DELETE` → 405). Era is chosen per request:
+- `params._meta["io.modelcontextprotocol/protocolVersion"]` present → **2026-07-28**: requires
+  `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` (base64 sentinel supported), mismatch → 400/-32020,
+  unknown version → 400/-32022 with `supported`, unknown method → 404/-32601. Results carry
+  `resultType`, serverInfo in `_meta`, `ttlMs`/`cacheScope` on lists.
+- otherwise → **2024-11-05…2025-11-25**: `initialize` negotiates, no `Mcp-Session-Id` is minted.
+- `tools/call` answers as SSE when the client accepts it, with 15 s keep-alive comments (survives
+  Cloudflare's ~100 s idle cutoff); otherwise plain JSON.
+- `Origin` validated (claude.ai / claude.com / localhost by default) → 403. Optional bearer token
+  (`auth_token`, `SSH_MCP_TOKEN`, `SSH_MCP_TOKEN_FILE`).
+
+Tasks extension (`io.modelcontextprotocol/tasks`) is **not** implemented: async is exposed as
+ordinary tools (run_id handle pattern), which works with every client today.
+
+## Known limits
+
+- Runs live in memory: a server restart loses run history, and in-flight commands lose their SSH
+  channel. Use `nohup`/`systemd-run` for jobs that must outlive the server.
+- sshd `MaxSessions` (default 10) caps channels per connection; `channels_per_conn` = 6 keeps
+  headroom because server-side teardown lags. A refused channel is retried with backoff.
+
