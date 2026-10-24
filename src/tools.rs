@@ -218,10 +218,13 @@ pub fn status_line(run: &Run) -> String {
         Status::Failed => format!("FAILED: {}", s.error.as_deref().unwrap_or("unknown error")),
         Status::Cancelled => "cancelled".into(),
         Status::TimedOut => format!(
-            "timed out after {}s and was killed",
+            "timed out after {}s",
             run.timeout.map(|t| t.as_secs()).unwrap_or(0)
         ),
     };
+    if matches!(s.status, Status::Cancelled | Status::TimedOut) && s.unkillable {
+        out.push_str(" — WARNING: could not signal the process (pid unknown); it may still be running");
+    }
     if matches!(s.status, Status::Cancelled | Status::TimedOut) {
         if let Some(c) = s.exit_code {
             let _ = write!(out, " (exit {c})");
@@ -324,6 +327,9 @@ async fn execute_command(app: &Arc<AppState>, args: Value) -> ToolOut {
     if a.command.trim().is_empty() {
         return err("command is empty");
     }
+    if a.command.contains('\0') || a.username.as_deref().is_some_and(|u| u.contains('\0')) || a.hostname.contains('\0') {
+        return err("command, hostname and username must not contain NUL bytes");
+    }
     let target = match app.pool.resolve(&a.hostname, a.username.as_deref()) {
         Ok(t) => t,
         Err(e) => return err(format!("{e:#}")),
@@ -351,6 +357,10 @@ async fn execute_command(app: &Arc<AppState>, args: Value) -> ToolOut {
             timeout,
         },
     );
+    let run = match run {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
     if a.background {
         return ok(format!(
             "[{}] started in background · run_id={}\nPoll with get_run(run_id=\"{}\", wait_secs=…).",
@@ -521,6 +531,9 @@ async fn write_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         Ok(t) => t,
         Err(e) => return err(format!("{e:#}")),
     };
+    if let Err(e) = crate::fileops::check_path(&a.path) {
+        return e;
+    }
     let data = match a.encoding.as_deref().unwrap_or("utf8") {
         "utf8" | "utf-8" | "text" => a.content.into_bytes(),
         "base64" => match base64::engine::general_purpose::STANDARD.decode(a.content.trim()) {
@@ -529,38 +542,37 @@ async fn write_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         },
         other => return err(format!("unknown encoding '{other}'")),
     };
-    if a.path.trim().is_empty() {
-        return err("path is empty");
-    }
     if let Some(m) = &a.mode
-        && (m.is_empty() || m.len() > 4 || !m.chars().all(|c| ('0'..='7').contains(&c))) {
-            return err("mode must be octal digits, e.g. 0644");
-        }
+        && (m.is_empty() || m.len() > 4 || !m.chars().all(|c| ('0'..='7').contains(&c)))
+    {
+        return err("mode must be octal digits, e.g. 0644");
+    }
     let p = sh_quote(&a.path);
-    let mut cmd = String::from("set -e; ");
+    let expected = data.len();
+    // Stage the upload in a temp file and verify it arrived complete before the
+    // target is touched, so an interrupted transfer can't truncate it.
+    let mut cmd = format!(
+        "set -e; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; cat > \"$tmp\"; n=$(wc -c < \"$tmp\"); \
+         [ $((n)) -eq {expected} ] || {{ echo \"incomplete upload ($n of {expected} bytes); target untouched\" >&2; exit 7; }}; "
+    );
     if a.mkdirs
-        && let Some((dir, _)) = a.path.rsplit_once('/').filter(|(d, _)| !d.is_empty()) {
-            let _ = write!(cmd, "mkdir -p -- {}; ", sh_quote(dir));
-        }
-    let _ = write!(cmd, "cat {} {p}; ", if a.append { ">>" } else { ">" });
+        && let Some((dir, _)) = a.path.rsplit_once('/').filter(|(d, _)| !d.is_empty())
+    {
+        let _ = write!(cmd, "mkdir -p -- {}; ", sh_quote(dir));
+    }
+    let _ = write!(cmd, "cat \"$tmp\" {} {p}; ", if a.append { ">>" } else { ">" });
     if let Some(m) = &a.mode {
-        let _ = write!(cmd, "chmod {m} {p}; ");
+        let _ = write!(cmd, "chmod {m} -- {p}; ");
     }
     let _ = write!(cmd, "wc -c < {p}");
-    let expected = data.len();
-    let run = app.runs.start(
-        target,
-        cmd,
-        StartOpts { sudo: a.sudo, stdin: Some(data), timeout: Some(Duration::from_secs(120)) },
-    );
-    run.wait(Duration::from_secs(130)).await;
-    let s = run.state();
-    let out = String::from_utf8_lossy(s.stdout.read_from(0, 64).1).trim().to_string();
-    let errs = String::from_utf8_lossy(s.stderr.read_from(0, 4096).1).trim().to_string();
-    if s.status != Status::Exited || s.exit_code != Some(0) {
-        drop(s);
-        return err(format!("write failed: {}\n{errs}", status_line(&run)));
+    let (run, out, errs) = match crate::fileops::run_collect(app, target, cmd, a.sudo, Some(data), 64).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !crate::fileops::succeeded(&run) {
+        return crate::fileops::failure(&run, "write", &errs);
     }
+    let out = String::from_utf8_lossy(&out).trim().to_string();
     let on_disk: Option<usize> = out.parse().ok();
     let verdict = match (a.append, on_disk) {
         (false, Some(n)) if n == expected => "verified".to_string(),

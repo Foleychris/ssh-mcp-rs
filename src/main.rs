@@ -87,7 +87,10 @@ async fn main() -> anyhow::Result<()> {
     let router = Router::new()
         .route(
             "/mcp",
-            post(mcp::handle).get(method_not_allowed).delete(method_not_allowed),
+            post(mcp::handle)
+                .get(method_not_allowed)
+                .delete(method_not_allowed)
+                .route_layer(axum::middleware::from_fn_with_state(app.clone(), mcp::gate)),
         )
         .route("/healthz", get(health))
         .layer(DefaultBodyLimit::max(cfg.limits.max_body_bytes))

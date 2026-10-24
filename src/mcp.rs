@@ -144,16 +144,19 @@ impl Caller {
     }
 }
 
-pub async fn handle(
+/// Auth + Origin gate, run as middleware so it executes BEFORE the request
+/// body is read: unauthenticated callers can't make the server buffer bodies.
+pub async fn gate(
     State(app): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    uri: axum::http::Uri,
-    headers: HeaderMap,
-    body: Bytes,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
 ) -> Response {
-    let caller = Caller::from(peer, &headers);
+    let headers = req.headers();
+    let uri = req.uri();
+    let caller = Caller::from(peer, headers);
     if let Some(tok) = &app.cfg.auth_token {
-        if !authorized(&app, tok, &uri, &headers) {
+        if !authorized(&app, tok, uri, headers) {
             let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-");
             warn!(target: "audit", client = %caller.client, peer = %caller.peer, user_agent = %crate::runs::truncate(ua, 120),
                   "rejected request: missing or wrong shared secret");
@@ -176,7 +179,16 @@ pub async fn handle(
             );
         }
     }
+    next.run(req).await
+}
 
+pub async fn handle(
+    State(app): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let caller = Caller::from(peer, &headers);
     let msg: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {

@@ -50,6 +50,10 @@ pub struct Limits {
     pub inline_output_bytes: usize,
     pub retain_finished_secs: u64,
     pub max_finished_runs: usize,
+    /// Total stdout+stderr bytes kept across finished runs; oldest are evicted beyond this.
+    pub retained_budget_bytes: usize,
+    /// Queued + running runs allowed at once; new runs are refused beyond this.
+    pub max_pending_runs: usize,
     pub max_body_bytes: usize,
 }
 
@@ -62,13 +66,16 @@ impl Default for Limits {
             connect_timeout_secs: 15,
             keepalive_secs: 20,
             default_wait_secs: 90,
-            max_wait_secs: 300,
+            // claude.ai's connector gives up on a tool call at ~230s; stay well under it.
+            max_wait_secs: 180,
             default_timeout_secs: 0,
             retained_output_bytes: 8 * 1024 * 1024,
             inline_output_bytes: 48 * 1024,
             retain_finished_secs: 24 * 3600,
             max_finished_runs: 1000,
-            max_body_bytes: 32 * 1024 * 1024,
+            retained_budget_bytes: 512 * 1024 * 1024,
+            max_pending_runs: 1024,
+            max_body_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -84,6 +91,10 @@ pub struct Config {
     /// Also accept the secret as `?key=` in the URL (for clients without custom headers).
     #[serde(default)]
     pub allow_query_token: bool,
+    /// Permit running with no auth_token on a non-loopback address. Off by default:
+    /// the server refuses to start rather than silently serving unauthenticated.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
     /// Origins accepted when a browser-style Origin header is present.
     #[serde(default = "d_origins")]
     pub allowed_origins: Vec<String>,
@@ -142,6 +153,9 @@ impl Config {
             }
         if let Ok(p) = std::env::var("SSH_MCP_TOKEN_FILE") {
             let t = std::fs::read_to_string(&p).with_context(|| format!("reading {p}"))?;
+            if t.trim().is_empty() {
+                bail!("SSH_MCP_TOKEN_FILE {p} is empty — refusing to start without the shared secret");
+            }
             cfg.auth_token = Some(t.trim().to_string());
         }
         if let Ok(l) = std::env::var("SSH_MCP_LISTEN") {
@@ -150,9 +164,41 @@ impl Config {
         if cfg.auth_token.as_deref() == Some("") {
             cfg.auth_token = None;
         }
+        if let Some(t) = &cfg.auth_token {
+            if t.len() < 32 {
+                bail!("auth_token is only {} characters; use at least 32 (e.g. `openssl rand -hex 32`)", t.len());
+            }
+        }
+        let loopback = cfg
+            .listen
+            .parse::<std::net::SocketAddr>()
+            .map(|a| a.ip().is_loopback())
+            .unwrap_or(false);
+        if cfg.auth_token.is_none() && !loopback && !cfg.allow_unauthenticated {
+            bail!(
+                "no auth_token configured and listen address {} is not loopback — refusing to start \
+                 (set SSH_MCP_TOKEN_FILE, or allow_unauthenticated = true if you really mean it)",
+                cfg.listen
+            );
+        }
+        for f in &cfg.known_hosts_files {
+            std::fs::File::open(f)
+                .with_context(|| format!("known_hosts file {} is missing or unreadable", f.display()))?;
+        }
         let l = &cfg.limits;
-        if l.channels_per_conn == 0 || l.max_conns_per_host == 0 || l.max_concurrent_runs == 0 {
+        if l.channels_per_conn == 0 || l.max_conns_per_host == 0 || l.max_concurrent_runs == 0 || l.max_pending_runs == 0 {
             bail!("limits must be non-zero");
+        }
+        // File tools read whole files (edit_file up to 4 MiB, images up to 5 MiB)
+        // through the run output buffer, which drops oldest bytes beyond this.
+        if l.retained_output_bytes < 6 * 1024 * 1024 {
+            bail!("limits.retained_output_bytes must be at least 6 MiB (file tools read whole files through it)");
+        }
+        if l.retained_output_bytes < l.inline_output_bytes {
+            bail!("limits.retained_output_bytes must be >= limits.inline_output_bytes");
+        }
+        if l.max_wait_secs > 220 {
+            bail!("limits.max_wait_secs must be <= 220 (claude.ai times out tool calls at ~230s)");
         }
         Ok(cfg)
     }

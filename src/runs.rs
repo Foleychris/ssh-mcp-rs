@@ -85,6 +85,17 @@ impl OutBuf {
         }
     }
 
+    /// Release spare capacity once a run has finished.
+    fn shrink(&mut self) {
+        self.data.shrink_to_fit();
+        self.head.shrink_to_fit();
+    }
+
+    /// Bytes currently held in memory.
+    pub fn held(&self) -> usize {
+        self.data.len() + self.head.len()
+    }
+
     /// Bytes dropped from the retained window (oldest output).
     pub fn dropped(&self) -> u64 {
         self.base
@@ -110,7 +121,7 @@ impl OutBuf {
         if tail_start <= h as u64 && self.base == 0 {
             return String::from_utf8_lossy(&self.data).into_owned();
         }
-        let omitted = tail_start - h as u64;
+        let omitted = tail_start.saturating_sub(h as u64);
         let mut s = String::from_utf8_lossy(&self.head[..h]).into_owned();
         if self.base > h as u64 {
             s.push_str(&format!(
@@ -141,6 +152,8 @@ pub struct RunState {
     pub finished: Option<Instant>,
     pub stdout: OutBuf,
     pub stderr: OutBuf,
+    /// A cancel/timeout tried to signal the process but its pid was never captured.
+    pub unkillable: bool,
     pid_scan: Option<Vec<u8>>,
 }
 
@@ -198,19 +211,21 @@ impl Run {
             return;
         };
         scan.extend_from_slice(b);
-        if let Some(nl) = scan.iter().position(|&c| c == b'\n') {
-            if scan.starts_with(PID_MARKER) {
-                let pid = std::str::from_utf8(&scan[PID_MARKER.len()..nl])
-                    .ok()
-                    .and_then(|v| v.trim().parse().ok());
-                s.pid = pid;
-                let rest = scan[nl + 1..].to_vec();
-                s.stderr.push(&rest);
-            } else {
-                s.stderr.push(&scan);
-            }
-        } else if scan.len() > 64 || !PID_MARKER.starts_with(&scan[..scan.len().min(PID_MARKER.len())]) {
-            s.stderr.push(&scan);
+        // The wrapper prints the marker first, but a login shell may print
+        // something (e.g. from ~/.bashrc) before it, so search the first 4 KiB.
+        let found = scan
+            .windows(PID_MARKER.len())
+            .position(|w| w == PID_MARKER)
+            .and_then(|i| scan[i..].iter().position(|&c| c == b'\n').map(|nl| (i, i + nl)));
+        if let Some((i, nl)) = found {
+            s.pid = std::str::from_utf8(&scan[i + PID_MARKER.len()..nl])
+                .ok()
+                .and_then(|v| v.trim().parse().ok());
+            let mut rest = scan[..i].to_vec();
+            rest.extend_from_slice(&scan[nl + 1..]);
+            s.stderr.push(&rest);
+        } else if scan.len() > 4096 {
+            s.stderr.push(&scan); // give up: no marker
         } else {
             s.pid_scan = Some(scan);
         }
@@ -264,7 +279,19 @@ impl Runs {
         })
     }
 
-    pub fn start(self: &Arc<Self>, target: Target, command: String, o: StartOpts) -> Arc<Run> {
+    pub fn start(
+        self: &Arc<Self>,
+        target: Target,
+        command: String,
+        o: StartOpts,
+    ) -> std::result::Result<Arc<Run>, String> {
+        let pending = self.active_count();
+        if pending >= self.cfg.limits.max_pending_runs {
+            warn!(target: "audit", pending, host = %target.alias, "run refused: too many pending runs");
+            return Err(format!(
+                "too many queued/running commands ({pending}); wait for some to finish or cancel_run them"
+            ));
+        }
         let cap = self.cfg.limits.retained_output_bytes;
         let (done_tx, _) = watch::channel(false);
         let run = Arc::new(Run {
@@ -286,6 +313,7 @@ impl Runs {
                 finished: None,
                 stdout: OutBuf::new(cap),
                 stderr: OutBuf::new(cap),
+                unkillable: false,
                 pid_scan: Some(Vec::new()),
             }),
             done_tx,
@@ -293,11 +321,11 @@ impl Runs {
         });
         self.map.lock().unwrap().insert(run.id.clone(), run.clone());
         info!(target: "audit", run = %run.id, host = %run.target.alias, user = %run.target.user,
-              sudo = run.sudo, cmd = %truncate(&run.command, 2000), "run started");
+              sudo = run.sudo, cmd = ?truncate(&run.command, 2000), "run started");
         let me = self.clone();
         let r = run.clone();
         tokio::spawn(async move { me.drive(r, o.stdin).await });
-        run
+        Ok(run)
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Run>> {
@@ -341,36 +369,74 @@ impl Runs {
             .filter(|r| r.is_done())
             .map(|r| (r.created, r.id.clone()))
             .collect();
+        done.sort();
         let max = self.cfg.limits.max_finished_runs;
-        if done.len() > max {
-            done.sort();
-            for (_, id) in done.iter().take(done.len() - max) {
-                m.remove(id);
-            }
+        let mut drop_n = done.len().saturating_sub(max);
+        // Memory budget across finished runs: evict oldest until under it.
+        let budget = self.cfg.limits.retained_budget_bytes;
+        let held = |id: &String| m.get(id).map(|r| { let s = r.state(); s.stdout.held() + s.stderr.held() }).unwrap_or(0);
+        let mut total: usize = done.iter().map(|(_, id)| held(id)).sum();
+        for (_, id) in done.iter().take(drop_n) {
+            total -= held(id);
+        }
+        while total > budget && drop_n < done.len() {
+            total -= held(&done[drop_n].1);
+            drop_n += 1;
+        }
+        if drop_n > 0 {
+            info!(evicted = drop_n, retained_bytes = total, "reaped finished runs");
+        }
+        for (_, id) in done.iter().take(drop_n) {
+            m.remove(id);
         }
     }
 
+    /// Run the reaper immediately (used when a large run finishes).
+    fn reap_soon(self: &Arc<Self>) {
+        let me = self.clone();
+        tokio::spawn(async move { me.reap() });
+    }
+
     async fn drive(self: Arc<Self>, run: Arc<Run>, stdin: Option<Vec<u8>>) {
+        // Host channel first, then a global slot: a run waiting on a busy host
+        // must not hold a global slot (that would starve runs to other hosts).
+        // Both waits honour cancel_run, and the status stays Queued until both
+        // are held, so a cancelled queued run never executes.
+        let opened = tokio::select! {
+            r = self.pool.open_channel(&run.target, false) => Some(r),
+            _ = run.cancel.cancelled() => None,
+        };
+        let (lease, ch) = match opened {
+            None => return self.finish(&run, Some(Status::Cancelled), Some("cancelled while queued".into())),
+            Some(Err(e)) => return self.finish(&run, Some(Status::Failed), Some(format!("{e:#}"))),
+            Some(Ok(v)) => v,
+        };
         let permit = tokio::select! {
             p = self.sem.clone().acquire_owned() => p.ok(),
             _ = run.cancel.cancelled() => None,
         };
-        if permit.is_none() {
-            self.finish(&run, Some(Status::Cancelled), Some("cancelled while queued".into()));
-            return;
+        if permit.is_none() || run.cancel.is_cancelled() {
+            drop(ch);
+            drop(lease);
+            return self.finish(&run, Some(Status::Cancelled), Some("cancelled while queued".into()));
         }
         {
             let mut s = run.state();
             s.status = Status::Running;
             s.started = Some(Instant::now());
         }
-        let res = self.drive_inner(&run, stdin).await;
+        let res = self.drive_inner(&run, ch, stdin).await;
+        drop(lease);
         let (status, err) = match res {
             Ok(st) => (st, None),
             Err(e) => (Some(Status::Failed), Some(format!("{e:#}"))),
         };
         self.finish(&run, status, err);
         drop(permit);
+        let big = { let s = run.state(); s.stdout.held() + s.stderr.held() > 16 * 1024 * 1024 };
+        if big {
+            self.reap_soon();
+        }
     }
 
     fn finish(&self, run: &Run, status: Option<Status>, err: Option<String>) {
@@ -392,6 +458,8 @@ impl Runs {
                 s.error = Some(e);
             }
             s.finished = Some(Instant::now());
+            s.stdout.shrink();
+            s.stderr.shrink();
             if s.started.is_none() {
                 s.started = s.finished;
             }
@@ -405,7 +473,10 @@ impl Runs {
     fn kill(&self, run: &Run, sig: &'static str) {
         let pid = run.state().pid;
         let Some(pid) = pid else {
-            warn!(run = %run.id, "no pid known; cannot signal");
+            warn!(target: "audit", run = %run.id, sig, "no pid known; cannot signal — remote process may still be running");
+            let mut s = run.state();
+            s.unkillable = true;
+            s.note = Some("could not signal the process (its pid was never captured); it may still be running on the host".into());
             return;
         };
         let sudo = if run.sudo { "sudo -n " } else { "" };
@@ -426,8 +497,12 @@ impl Runs {
     }
 
     /// Returns Some(status) to force a terminal status, None to derive it.
-    async fn drive_inner(&self, run: &Run, stdin: Option<Vec<u8>>) -> Result<Option<Status>> {
-        let (_lease, ch) = self.pool.open_channel(&run.target, false).await?;
+    async fn drive_inner(
+        &self,
+        run: &Run,
+        ch: russh::Channel<russh::client::Msg>,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<Option<Status>> {
         ch.exec(true, wrap(&run.command, run.sudo)).await?;
         let (mut rd, wr) = ch.split();
 
@@ -466,6 +541,11 @@ impl Runs {
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         run.state().exit_code = Some(exit_status);
                         exit_at.get_or_insert_with(tokio::time::Instant::now);
+                    }
+                    Some(ChannelMsg::Failure) if exit_at.is_none() && run.state().pid.is_none() => {
+                        // sshd refused the exec request (e.g. MaxSessions, ForceCommand).
+                        let _ = wr.close().await;
+                        anyhow::bail!("the SSH server refused to execute the command");
                     }
                     Some(ChannelMsg::ExitSignal { signal_name, error_message, .. }) => {
                         let mut s = run.state();

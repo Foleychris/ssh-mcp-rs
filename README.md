@@ -56,6 +56,22 @@ ordinary tools (run_id handle pattern), which works with every client today.
 Every tool call, run start (full command, host, user, sudo) and run finish (status, exit, duration),
 and every rejected request (Cf-Connecting-Ip client, peer, user agent) is logged with target `audit`.
 
+## Hardening (2026-10-24 review)
+
+- Refuses to start if `SSH_MCP_TOKEN_FILE` is empty, the token is under 32 chars, there is no token on a
+  non-loopback address (unless `allow_unauthenticated = true`), or a configured `known_hosts` file is missing.
+- Host keys fail closed: a key must exactly match a recorded key; a host with recorded keys of other types
+  only is refused (russh treats a different key type as "unknown", which would otherwise be learned).
+- Runs wait for their host channel before taking a global slot; `cancel_run` on a queued run guarantees it
+  never executes. Pending runs are capped (`max_pending_runs`); finished-run output has a memory budget
+  (`retained_budget_bytes`).
+- `write_file` / `edit_file` stage uploads in a temp file and verify the size before touching the target.
+  File tools cancel their run if it doesn't finish in time, and refuse partial reads.
+- Auth runs as middleware before the body is read; body limit 16 MiB. `wait_secs` max is 180
+  (claude.ai times out tool calls at ~230s).
+- Audit log escapes control characters in commands.
+- Deferred: the per-host connection list lock is held during a new SSH connect (only slow when a host is down).
+
 ## Known limits
 
 - Runs live in memory: a server restart loses run history, and in-flight commands lose their SSH

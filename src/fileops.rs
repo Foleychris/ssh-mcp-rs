@@ -16,30 +16,59 @@ const READ_DEFAULT: u64 = 256 * 1024;
 const IMAGE_MAX: u64 = 5 * 1024 * 1024;
 const EDIT_MAX: u64 = 4 * 1024 * 1024;
 
+/// Validate a path argument: absolute, no NUL (sshd rejects NUL in exec strings
+/// and would drop the whole shared connection).
+pub(crate) fn check_path(path: &str) -> Result<(), ToolOut> {
+    if path.contains('\0') {
+        return Err(err("path contains a NUL byte"));
+    }
+    if !path.starts_with('/') {
+        return Err(err(format!("path must be absolute (got {path:?})")));
+    }
+    Ok(())
+}
+
 /// Run a helper command to completion and return (run, stdout bytes, stderr text).
-async fn run_collect(
+/// If it hasn't finished within the wait, it is cancelled — a file operation
+/// must never report failure and then quietly happen later.
+pub(crate) async fn run_collect(
     app: &Arc<AppState>,
     target: crate::ssh::Target,
     cmd: String,
     sudo: bool,
     stdin: Option<Vec<u8>>,
     max_out: usize,
-) -> (Arc<Run>, Vec<u8>, String) {
-    let run = app.runs.start(target, cmd, StartOpts { sudo, stdin, timeout: Some(Duration::from_secs(120)) });
-    run.wait(Duration::from_secs(130)).await;
+) -> Result<(Arc<Run>, Vec<u8>, String), ToolOut> {
+    let run = app
+        .runs
+        .start(target, cmd, StartOpts { sudo, stdin, timeout: Some(Duration::from_secs(120)) })
+        .map_err(err)?;
+    if !run.wait(Duration::from_secs(130)).await {
+        app.runs.cancel(&run);
+        run.wait(Duration::from_secs(12)).await;
+        return Err(err(format!(
+            "[{}] file operation did not finish within 130s and was cancelled ({}); nothing should have been written — check before retrying",
+            run.target.alias,
+            status_line(&run)
+        )));
+    }
     let s = run.state();
+    if s.stdout.dropped() > 0 {
+        drop(s);
+        return Err(err("output exceeded the server's retention window; refusing to use a partial read"));
+    }
     let out = s.stdout.read_from(0, max_out).1.to_vec();
     let errs = String::from_utf8_lossy(s.stderr.read_from(0, 16 * 1024).1).into_owned();
     drop(s);
-    (run, out, errs)
+    Ok((run, out, errs))
 }
 
-fn succeeded(run: &Run) -> bool {
+pub(crate) fn succeeded(run: &Run) -> bool {
     let s = run.state();
     s.status == Status::Exited && s.exit_code == Some(0)
 }
 
-fn failure(run: &Run, what: &str, errs: &str) -> ToolOut {
+pub(crate) fn failure(run: &Run, what: &str, errs: &str) -> ToolOut {
     let why = errs.lines().filter(|l| !l.starts_with("META ")).collect::<Vec<_>>().join(" ");
     err(format!("[{}] {what} failed: {} {}", run.target.alias, status_line(run), why.trim()))
 }
@@ -98,8 +127,8 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         Ok(t) => t,
         Err(e) => return err(format!("{e:#}")),
     };
-    if a.path.trim().is_empty() {
-        return err("path is empty");
+    if let Err(e) = check_path(&a.path) {
+        return e;
     }
     let enc = a.encoding.as_deref().unwrap_or("auto");
     if !matches!(enc, "auto" | "utf8" | "utf-8" | "base64") {
@@ -116,7 +145,10 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         checks(&p, false),
         a.offset + 1
     );
-    let (run, mut data, errs) = run_collect(app, target, cmd, a.sudo, None, fetch as usize).await;
+    let (run, mut data, errs) = match run_collect(app, target, cmd, a.sudo, None, fetch as usize).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     if !succeeded(&run) {
         return failure(&run, "read", &errs);
     }
@@ -156,6 +188,16 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         String::new()
     };
     data.truncate(len as usize);
+    // A chunk boundary may split a multi-byte character: in auto mode, end the
+    // chunk at the last complete character and let next_offset resume there.
+    if enc == "auto" && image_note.is_empty() {
+        if let Err(e) = std::str::from_utf8(&data) {
+            let at_eof = size.is_some_and(|sz| a.offset + data.len() as u64 >= sz);
+            if e.error_len().is_none() && !at_eof && e.valid_up_to() > 0 {
+                data.truncate(e.valid_up_to());
+            }
+        }
+    }
     let n = data.len() as u64;
     let eof = size.is_none_or(|sz| a.offset + n >= sz);
     let as_text = match enc {
@@ -198,7 +240,7 @@ pub struct EditArgs {
 }
 
 fn line_of(text: &str, byte: usize) -> usize {
-    text[..byte].bytes().filter(|&b| b == b'\n').count() + 1
+    text.as_bytes()[..byte.min(text.len())].iter().filter(|&&b| b == b'\n').count() + 1
 }
 
 /// Numbered context lines around a byte range of `text`.
@@ -225,6 +267,9 @@ pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         Ok(t) => t,
         Err(e) => return err(format!("{e:#}")),
     };
+    if let Err(e) = check_path(&a.path) {
+        return e;
+    }
     if a.old_string.is_empty() {
         return err("old_string is empty (use write_file to create or overwrite a file)");
     }
@@ -239,7 +284,10 @@ pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
          echo \"META $(sha256sum < {p} | cut -d' ' -f1)\" >&2; cat -- {p}",
         checks(&p, true)
     );
-    let (run, data, errs) = run_collect(app, target.clone(), read_cmd, a.sudo, None, EDIT_MAX as usize + 1).await;
+    let (run, data, errs) = match run_collect(app, target.clone(), read_cmd, a.sudo, None, EDIT_MAX as usize + 1).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     if !succeeded(&run) {
         return failure(&run, "edit (read)", &errs);
     }
@@ -293,12 +341,20 @@ pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
     let expected = out.len();
 
     // 4. Write back in place (keeps inode, owner, mode) iff unchanged since the read.
+    // Stage the upload in a temp file and check it arrived complete before the
+    // target is touched; only then re-check the guard and copy in place
+    // (`cat tmp > file` keeps the target's inode, owner and mode).
     let write_cmd = format!(
-        "set -e; cur=$(sha256sum < {p} | cut -d' ' -f1); \
+        "set -e; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; cat > \"$tmp\"; n=$(wc -c < \"$tmp\"); \
+         [ $((n)) -eq {expected} ] || {{ echo \"incomplete upload ($n of {expected} bytes); file untouched\" >&2; exit 7; }}; \
+         cur=$(sha256sum < {p} | cut -d' ' -f1); \
          [ \"$cur\" = \"{sha}\" ] || {{ echo 'file changed since it was read; nothing written — re-run edit_file' >&2; exit 5; }}; \
-         cat > {p}; wc -c < {p}"
+         cat \"$tmp\" > {p}; wc -c < {p}"
     );
-    let (wrun, wout, werrs) = run_collect(app, target, write_cmd, a.sudo, Some(out.clone().into_bytes()), 64).await;
+    let (wrun, wout, werrs) = match run_collect(app, target, write_cmd, a.sudo, Some(out.clone().into_bytes()), 64).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     if !succeeded(&wrun) {
         return failure(&wrun, "edit (write)", &werrs);
     }

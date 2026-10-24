@@ -62,26 +62,44 @@ struct KeyCheck {
 static LEARN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl KeyCheck {
+    /// Fail closed: a key is accepted only if it exactly matches a recorded key
+    /// for this host. A host with ANY recorded key (of any type) that doesn't
+    /// match is refused — russh reports a different-type key as "unknown", not
+    /// "changed", so without this an attacker could present e.g. an RSA key to
+    /// a host we only know by its ed25519 key and have it learned (downgrade).
+    /// Unparseable known_hosts files also refuse rather than fall back to TOFU.
     fn verify(&self, host: &str, port: u16, key: &PublicKey) -> std::result::Result<(), String> {
         let fp = key.fingerprint(HashAlg::Sha256).to_string();
         let mut files: Vec<&PathBuf> = self.files.iter().collect();
-        files.push(&self.learned);
+        if self.learned.exists() {
+            files.push(&self.learned);
+        }
+        let mut recorded_types: Vec<String> = Vec::new();
         for f in files {
-            if !f.exists() {
-                continue;
-            }
-            match russh::keys::check_known_hosts_path(host, port, key, f) {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(russh::keys::Error::KeyChanged { line }) => {
+            let entries = russh::keys::known_hosts::known_host_keys_path(host, port, f).map_err(|e| {
+                format!("cannot read known_hosts {} ({e}); refusing to connect to {host}:{port}", f.display())
+            })?;
+            for (line, recorded) in entries {
+                if recorded == *key {
+                    return Ok(());
+                }
+                if recorded.algorithm() == key.algorithm() {
                     return Err(format!(
                         "HOST KEY MISMATCH for {host}:{port} — server presented {fp}, which differs \
                          from {} line {line}. Refusing to connect.",
                         f.display()
                     ));
                 }
-                Err(e) => warn!("known_hosts {}: {e}", f.display()),
+                recorded_types.push(format!("{} ({}:{line})", recorded.algorithm(), f.display()));
             }
+        }
+        if !recorded_types.is_empty() {
+            return Err(format!(
+                "host {host}:{port} presented a {} key ({fp}) but only other key types are recorded: {}. \
+                 Refusing (possible downgrade/MITM). If the host really changed keys, add the new key to known_hosts.",
+                key.algorithm(),
+                recorded_types.join(", ")
+            ));
         }
         match self.policy {
             HostKeyPolicy::Strict => Err(format!(
@@ -100,7 +118,7 @@ impl KeyCheck {
                 }
                 learn_known_hosts_path(host, port, key, &self.learned)
                     .map_err(|e| format!("could not record host key: {e}"))?;
-                info!(%host, port, %fp, "learned new host key (accept-new)");
+                warn!(%host, port, %fp, "learned new host key (accept-new)");
                 Ok(())
             }
         }
