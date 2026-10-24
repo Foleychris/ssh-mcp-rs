@@ -566,7 +566,7 @@ async fn write_file(app: &Arc<AppState>, args: Value) -> ToolOut {
     {
         let _ = write!(cmd, "mkdir -p -- {}; ", sh_quote(dir));
     }
-    let _ = write!(cmd, "cat \"$tmp\" {} {p}; ", if a.append { ">>" } else { ">" });
+    cmd.push_str(&crate::fileops::copy_staged(&p, a.append));
     if let Some(m) = &a.mode {
         let _ = write!(cmd, "chmod {m} -- {p}; ");
     }
@@ -586,12 +586,18 @@ async fn write_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         (true, Some(_)) => "appended".to_string(),
         (_, None) => format!("could not verify size (wc said {out:?})"),
     };
-    ok(format!(
+    let good = match (a.append, on_disk) {
+        (false, Some(n)) => n == expected,
+        (true, Some(_)) => true,
+        (_, None) => false,
+    };
+    let t = format!(
         "[{}] wrote {expected} bytes to {} — file is now {} bytes ({verdict})",
         run.target.alias,
         a.path,
         on_disk.map(|n| n.to_string()).unwrap_or("?".into())
-    ))
+    );
+    if good { ok(t) } else { err(t) }
 }
 
 // ---------------------------------------------------------------- host info
