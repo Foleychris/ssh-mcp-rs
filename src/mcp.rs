@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub const MODERN: &str = "2026-07-28";
 pub const LEGACY: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -122,15 +122,41 @@ fn decode_header_value(v: &str) -> Option<String> {
     }
 }
 
+/// Who is calling, for the audit log: the TCP peer plus, when present, the
+/// original client IP that Cloudflare forwards in `Cf-Connecting-Ip`.
+/// (The header is informational only — anything that can reach the port
+/// directly could set it.)
+pub struct Caller {
+    pub peer: String,
+    pub client: String,
+}
+
+impl Caller {
+    fn from(peer: std::net::SocketAddr, headers: &HeaderMap) -> Self {
+        let client = headers
+            .get("cf-connecting-ip")
+            .or_else(|| headers.get("x-forwarded-for"))
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "-".into());
+        Self { peer: peer.ip().to_string(), client }
+    }
+}
+
 pub async fn handle(
     State(app): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     uri: axum::http::Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let caller = Caller::from(peer, &headers);
     if let Some(tok) = &app.cfg.auth_token {
         if !authorized(&app, tok, &uri, &headers) {
-            info!("rejected request: missing or wrong shared secret");
+            let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-");
+            warn!(target: "audit", client = %caller.client, peer = %caller.peer, user_agent = %crate::runs::truncate(ua, 120),
+                  "rejected request: missing or wrong shared secret");
             return (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Bearer")],
@@ -142,7 +168,8 @@ pub async fn handle(
     if let Some(o) = headers.get(header::ORIGIN) {
         let o = o.to_str().unwrap_or("");
         if !origin_ok(&app, o) {
-            info!(origin = o, "rejected request with disallowed Origin");
+            warn!(target: "audit", client = %caller.client, peer = %caller.peer, origin = o,
+                  "rejected request with disallowed Origin");
             return json_resp(
                 StatusCode::FORBIDDEN,
                 rpc_err(&Value::Null, E_INVALID_REQUEST, "Origin not allowed", None),
@@ -188,8 +215,8 @@ pub async fn handle(
 
     debug!(method, ?version, "request");
     match version {
-        Some(v) => modern(app, &headers, id.clone(), method, params, &v, wants_sse).await,
-        None => legacy(app, id.clone(), method, params, wants_sse).await,
+        Some(v) => modern(app, &headers, id.clone(), method, params, &v, wants_sse, &caller).await,
+        None => legacy(app, id.clone(), method, params, wants_sse, &caller).await,
     }
 }
 
@@ -241,6 +268,7 @@ async fn modern(
     params: Value,
     v: &str,
     wants_sse: bool,
+    caller: &Caller,
 ) -> Response {
     if v != MODERN {
         return json_resp(
@@ -270,7 +298,7 @@ async fn modern(
             "ttlMs": 300_000,
             "cacheScope": "private",
         })))),
-        "tools/call" => tools_call(app, id, params, wants_sse, true).await,
+        "tools/call" => tools_call(app, id, params, wants_sse, true, caller).await,
         _ => json_resp(
             StatusCode::NOT_FOUND,
             rpc_err(&id, E_METHOD, format!("Method not found: {method}"), None),
@@ -278,7 +306,14 @@ async fn modern(
     }
 }
 
-async fn legacy(app: Arc<AppState>, id: Value, method: &str, params: Value, wants_sse: bool) -> Response {
+async fn legacy(
+    app: Arc<AppState>,
+    id: Value,
+    method: &str,
+    params: Value,
+    wants_sse: bool,
+    caller: &Caller,
+) -> Response {
     match method {
         "initialize" => {
             let req = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
@@ -298,12 +333,19 @@ async fn legacy(app: Arc<AppState>, id: Value, method: &str, params: Value, want
             "instructions": instructions(&app),
         })))),
         "tools/list" => json_resp(StatusCode::OK, rpc_ok(&id, json!({"tools": tools::definitions(&app)}))),
-        "tools/call" => tools_call(app, id, params, wants_sse, false).await,
+        "tools/call" => tools_call(app, id, params, wants_sse, false, caller).await,
         _ => json_resp(StatusCode::OK, rpc_err(&id, E_METHOD, format!("Method not found: {method}"), None)),
     }
 }
 
-async fn tools_call(app: Arc<AppState>, id: Value, params: Value, wants_sse: bool, modern: bool) -> Response {
+async fn tools_call(
+    app: Arc<AppState>,
+    id: Value,
+    params: Value,
+    wants_sse: bool,
+    modern: bool,
+    caller: &Caller,
+) -> Response {
     let Some(name) = params.get("name").and_then(Value::as_str).map(String::from) else {
         return json_resp(StatusCode::OK, rpc_err(&id, E_PARAMS, "tools/call requires params.name", None));
     };
@@ -311,6 +353,13 @@ async fn tools_call(app: Arc<AppState>, id: Value, params: Value, wants_sse: boo
     if !tools::definitions(&app).iter().any(|t| t["name"] == name.as_str()) {
         return json_resp(StatusCode::OK, rpc_err(&id, E_PARAMS, format!("Unknown tool: {name}"), None));
     }
+
+    // Audit: one line per tool call. Command text and exit status are logged by
+    // the run itself (target "audit" in runs.rs), keyed by run_id.
+    let s = |k: &str| args.get(k).and_then(Value::as_str).map(|v| crate::runs::truncate(v, 200));
+    info!(target: "audit", tool = %name, client = %caller.client, peer = %caller.peer,
+          host = s("hostname").as_deref().unwrap_or("-"), path = s("path").as_deref().unwrap_or("-"),
+          run_id = s("run_id").as_deref().unwrap_or("-"), "tool call");
 
     // Run the tool on its own task: if the client disconnects mid-call the
     // work (and any SSH run it started) carries on and stays reachable via list_runs.

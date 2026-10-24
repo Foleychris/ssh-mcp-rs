@@ -118,6 +118,21 @@ pub fn definitions(app: &AppState) -> Vec<Value> {
             "annotations": {"destructiveHint": true, "openWorldHint": false}
         }),
         json!({
+            "name": "read_file",
+            "title": "Read file",
+            "description": "Read a file on a host, binary-safe. Returns text when the bytes are valid UTF-8 (no NULs), otherwise base64 (force either with encoding). Reads up to `length` bytes from `offset` (default 256 KiB from 0, max 4 MiB per call); the header gives the file size, mode, owner, mtime and next_offset for paging. Use instead of `cat` for large or binary files.",
+            "inputSchema": {"type": "object", "properties": {
+                "hostname": {"type": "string", "description": host_desc},
+                "path": {"type": "string", "description": "Absolute path."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Byte offset to start at (default 0)."},
+                "length": {"type": "integer", "minimum": 1, "maximum": 4194304, "description": "Max bytes to return (default 262144)."},
+                "encoding": {"type": "string", "enum": ["auto", "utf8", "base64"], "description": "Default auto."},
+                "sudo": {"type": "boolean", "description": "Read as root."},
+                "username": {"type": "string", "description": user_desc}
+            }, "required": ["hostname", "path"]},
+            "annotations": {"readOnlyHint": true, "openWorldHint": false}
+        }),
+        json!({
             "name": "get_server_info",
             "title": "Server info",
             "description": "OS, uptime/load, CPU, memory, disks and network addresses of a host.",
@@ -155,6 +170,7 @@ pub async fn call(app: &Arc<AppState>, name: &str, args: Value) -> Option<ToolOu
         "list_runs" => list_runs(app, args),
         "cancel_run" => cancel_run(app, args).await,
         "write_file" => write_file(app, args).await,
+        "read_file" => read_file(app, args).await,
         "get_server_info" => server_info(app, args).await,
         "test_ssh_connection" => test_conn(app, args).await,
         "list_hosts" => list_hosts(app),
@@ -540,6 +556,107 @@ async fn write_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         a.path,
         on_disk.map(|n| n.to_string()).unwrap_or("?".into())
     ))
+}
+
+#[derive(Deserialize)]
+struct ReadArgs {
+    hostname: String,
+    path: String,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    length: Option<u64>,
+    #[serde(default)]
+    encoding: Option<String>,
+    #[serde(default)]
+    sudo: bool,
+    #[serde(default)]
+    username: Option<String>,
+}
+
+const READ_MAX: u64 = 4 * 1024 * 1024;
+
+async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
+    let a: ReadArgs = match parse(args) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let target = match app.pool.resolve(&a.hostname, a.username.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return err(format!("{e:#}")),
+    };
+    if a.path.trim().is_empty() {
+        return err("path is empty");
+    }
+    let enc = a.encoding.as_deref().unwrap_or("auto");
+    if !matches!(enc, "auto" | "utf8" | "utf-8" | "base64") {
+        return err(format!("unknown encoding '{enc}'"));
+    }
+    let len = a.length.unwrap_or(256 * 1024).clamp(1, READ_MAX);
+    let p = sh_quote(&a.path);
+    // Metadata goes to stderr as one line, the requested byte range to stdout.
+    // Works with GNU coreutils and busybox. `tail -c +N` is 1-based.
+    let cmd = format!(
+        "set -e; [ -e {p} ] || {{ echo 'no such file' >&2; exit 2; }}; [ -d {p} ] && {{ echo 'is a directory' >&2; exit 3; }}; \
+         [ -r {p} ] || {{ echo 'permission denied (try sudo=true)' >&2; exit 4; }}; \
+         echo \"META $(stat -L -c '%s|%A|%U:%G|%y' -- {p} 2>/dev/null || wc -c < {p})\" >&2; \
+         tail -c +{} -- {p} | head -c {len}",
+        a.offset + 1
+    );
+    let run = app.runs.start(
+        target,
+        cmd,
+        StartOpts { sudo: a.sudo, stdin: None, timeout: Some(Duration::from_secs(120)) },
+    );
+    run.wait(Duration::from_secs(130)).await;
+    let s = run.state();
+    let errs = String::from_utf8_lossy(s.stderr.read_from(0, 8192).1).to_string();
+    if s.status != Status::Exited || s.exit_code != Some(0) {
+        drop(s);
+        let why = errs.lines().find(|l| !l.starts_with("META ")).unwrap_or("").trim().to_string();
+        return err(format!("[{}] read failed: {} {}", run.target.alias, status_line(&run), why));
+    }
+    let meta = errs.lines().find_map(|l| l.strip_prefix("META ")).unwrap_or("").trim().to_string();
+    let mut f = meta.split('|');
+    let size: Option<u64> = f.next().and_then(|v| v.trim().parse().ok());
+    let rest: Vec<&str> = f.collect();
+    let data = s.stdout.read_from(0, len as usize).1.to_vec();
+    drop(s);
+    let n = data.len() as u64;
+    let next = a.offset + n;
+    let eof = size.is_none_or(|sz| next >= sz);
+    let as_text = match enc {
+        "base64" => None,
+        "utf8" | "utf-8" => Some(String::from_utf8_lossy(&data).into_owned()),
+        _ => std::str::from_utf8(&data).ok().filter(|t| !t.contains('\0')).map(str::to_string),
+    };
+    let mut t = format!(
+        "[{}] {} — bytes {}..{} of {}{}",
+        run.target.alias,
+        a.path,
+        a.offset,
+        next,
+        size.map(|v| v.to_string()).unwrap_or("?".into()),
+        if eof { " (EOF)".to_string() } else { format!(" (next_offset={next})") }
+    );
+    if !rest.is_empty() {
+        let _ = write!(t, "\n{}", rest.join("  "));
+    }
+    match as_text {
+        Some(txt) => {
+            // A cut at `length` may split a UTF-8 sequence; auto mode then falls back to base64.
+            let _ = write!(t, "\n--- utf8 ---\n{txt}");
+        }
+        None => {
+            let _ = write!(
+                t,
+                "\n--- base64 ({n} bytes{}) ---\n{}",
+                if enc == "auto" { "; not valid UTF-8 text" } else { "" },
+                base64::engine::general_purpose::STANDARD.encode(&data)
+            );
+        }
+    }
+    ok(t)
 }
 
 // ---------------------------------------------------------------- host info

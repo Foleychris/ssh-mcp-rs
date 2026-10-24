@@ -292,8 +292,8 @@ impl Runs {
             cancel: CancellationToken::new(),
         });
         self.map.lock().unwrap().insert(run.id.clone(), run.clone());
-        info!(run = %run.id, host = %run.target.alias, user = %run.target.user,
-              cmd = %truncate(&run.command, 300), "run started");
+        info!(target: "audit", run = %run.id, host = %run.target.alias, user = %run.target.user,
+              sudo = run.sudo, cmd = %truncate(&run.command, 2000), "run started");
         let me = self.clone();
         let r = run.clone();
         tokio::spawn(async move { me.drive(r, o.stdin).await });
@@ -395,7 +395,8 @@ impl Runs {
             if s.started.is_none() {
                 s.started = s.finished;
             }
-            info!(run = %run.id, status = s.status.as_str(), exit = ?s.exit_code,
+            info!(target: "audit", run = %run.id, host = %run.target.alias, status = s.status.as_str(),
+                  exit = ?s.exit_code, secs = run.created.elapsed().as_secs(),
                   out = s.stdout.total, err = s.stderr.total, "run finished");
         }
         run.done_tx.send_replace(true);

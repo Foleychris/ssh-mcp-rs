@@ -100,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         warn!("listening on non-loopback {addr} WITHOUT an auth token");
     }
     info!(%addr, hosts = cfg.hosts.len(), auth = cfg.auth_token.is_some(), "ssh-mcp-rs listening on /mcp");
-    axum::serve(listener, router)
+    axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())

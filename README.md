@@ -26,6 +26,7 @@ MCP eras. ~2.2k lines of Rust, one binary; ~42 MB RSS after 1000 concurrent runs
 - `get_run(run_id, wait_secs?, stdout_offset?, stderr_offset?, max_bytes?)`
 - `list_runs(active_only?, hostname?, limit?)`, `cancel_run(run_id)`
 - `write_file(hostname, path, content, encoding?, append?, mkdirs?, mode?, sudo?, username?)`
+- `read_file(hostname, path, offset?, length?, encoding?, sudo?, username?)` — binary-safe (auto base64), paged, max 4 MiB/call
 - `get_server_info`, `test_ssh_connection`, `list_hosts`
 
 Hosts come from config; unlisted hostnames/IPs
@@ -48,6 +49,11 @@ One endpoint, `POST /mcp` (`GET`/`DELETE` → 405). Era is chosen per request:
 
 Tasks extension (`io.modelcontextprotocol/tasks`) is **not** implemented: async is exposed as
 ordinary tools (run_id handle pattern), which works with every client today.
+
+## Audit log
+
+Every tool call, run start (full command, host, user, sudo) and run finish (status, exit, duration),
+and every rejected request (Cf-Connecting-Ip client, peer, user agent) is logged with target `audit`.
 
 ## Known limits
 
