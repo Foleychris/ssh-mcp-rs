@@ -1,4 +1,6 @@
-//! MCP over Streamable HTTP. Serves both eras on one endpoint:
+//! MCP JSON-RPC (both eras) and its Streamable HTTP transport. The protocol
+//! layer ([`dispatch`] / [`handle_message`]) is transport-agnostic.
+//! Serves both eras on one endpoint:
 //!  * 2026-07-28 (stateless; per-request `_meta` + mirrored headers, `server/discover`)
 //!  * 2024-11-05 … 2025-11-25 (`initialize` handshake), handled statelessly —
 //!    no Mcp-Session-Id is minted, so any request can land anywhere.
@@ -122,28 +124,6 @@ fn decode_header_value(v: &str) -> Option<String> {
     }
 }
 
-/// Who is calling, for the audit log: the TCP peer plus, when present, the
-/// original client IP that Cloudflare forwards in `Cf-Connecting-Ip`.
-/// (The header is informational only — anything that can reach the port
-/// directly could set it.)
-pub struct Caller {
-    pub peer: String,
-    pub client: String,
-}
-
-impl Caller {
-    fn from(peer: std::net::SocketAddr, headers: &HeaderMap) -> Self {
-        let client = headers
-            .get("cf-connecting-ip")
-            .or_else(|| headers.get("x-forwarded-for"))
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "-".into());
-        Self { peer: peer.ip().to_string(), client }
-    }
-}
-
 /// Auth + Origin gate, run as middleware so it executes BEFORE the request
 /// body is read: unauthenticated callers can't make the server buffer bodies.
 pub async fn gate(
@@ -154,7 +134,7 @@ pub async fn gate(
 ) -> Response {
     let headers = req.headers();
     let uri = req.uri();
-    let caller = Caller::from(peer, headers);
+    let caller = CallCtx::http(peer, headers);
     if let Some(tok) = &app.cfg.auth_token {
         if !authorized(&app, tok, uri, headers) {
             let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-");
@@ -182,13 +162,27 @@ pub async fn gate(
     next.run(req).await
 }
 
+
+// ---------------------------------------------------------------- HTTP transport
+
+/// HTTP status for a JSON-RPC reply produced by [`dispatch`]: malformed
+/// requests and version errors are 400; an unknown method in the modern era is
+/// 404; everything else (including tool and params errors) is 200.
+fn http_status(reply: &Value, modern: bool) -> StatusCode {
+    match reply.pointer("/error/code").and_then(Value::as_i64) {
+        Some(E_PARSE | E_INVALID_REQUEST | E_HEADER | E_VERSION) => StatusCode::BAD_REQUEST,
+        Some(E_METHOD) if modern => StatusCode::NOT_FOUND,
+        _ => StatusCode::OK,
+    }
+}
+
 pub async fn handle(
     State(app): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let caller = Caller::from(peer, &headers);
+    let ctx = CallCtx::http(peer, &headers);
     let msg: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -198,37 +192,43 @@ pub async fn handle(
             );
         }
     };
-    if msg.is_array() {
-        return json_resp(
-            StatusCode::BAD_REQUEST,
-            rpc_err(&Value::Null, E_INVALID_REQUEST, "JSON-RPC batches are not supported", None),
-        );
+    let version = protocol_version(&msg);
+    let modern = version.is_some();
+    // The 2026-07-28 header mirror is HTTP-only. A wrong version is reported
+    // by dispatch (before any header check), as before the transport split.
+    if let (Some(v), Some(obj)) = (version.as_deref(), msg.as_object())
+        && v == MODERN
+        && let (Some(method), Some(id)) = (obj.get("method").and_then(Value::as_str), obj.get("id"))
+    {
+        let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
+        if let Some(r) = header_check(&headers, id, method, &params, v) {
+            return r;
+        }
     }
-    let Some(obj) = msg.as_object() else {
-        return json_resp(
-            StatusCode::BAD_REQUEST,
-            rpc_err(&Value::Null, E_INVALID_REQUEST, "expected a JSON-RPC object", None),
-        );
-    };
-    let (Some(method), Some(id)) = (obj.get("method").and_then(Value::as_str), obj.get("id")) else {
-        // Notification (e.g. notifications/initialized) or a stray response.
-        return StatusCode::ACCEPTED.into_response();
-    };
-    let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
-    let version = params
-        .get("_meta")
-        .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
-        .and_then(Value::as_str)
-        .map(String::from);
     let wants_sse = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("text/event-stream"));
 
-    debug!(method, ?version, "request");
-    match version {
-        Some(v) => modern(app, &headers, id.clone(), method, params, &v, wants_sse, &caller).await,
-        None => legacy(app, id.clone(), method, params, wants_sse, &caller).await,
+    match dispatch(app, msg, ctx) {
+        Dispatch::Reply(None) => StatusCode::ACCEPTED.into_response(),
+        Dispatch::Reply(Some(r)) => json_resp(http_status(&r, modern), r),
+        Dispatch::Call(fut) if wants_sse => {
+            // SSE with keep-alive comments so proxies with idle timeouts
+            // (e.g. Cloudflare's ~100s) don't cut long synchronous calls.
+            // Dropping the stream (client gone) drops `fut`, not the tool task.
+            let stream = async_stream::stream! {
+                let body = fut.await;
+                yield Ok::<Event, Infallible>(Event::default().event("message").data(body.to_string()));
+            };
+            let mut resp = Sse::new(stream)
+                .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keepalive"))
+                .into_response();
+            resp.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
+            resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            resp
+        }
+        Dispatch::Call(fut) => json_resp(StatusCode::OK, fut.await),
     }
 }
 
@@ -262,6 +262,95 @@ fn header_check(headers: &HeaderMap, id: &Value, method: &str, params: &Value, v
     None
 }
 
+// ---------------------------------------------------------------- transport-neutral JSON-RPC
+
+/// Per-request context shared by every transport: who is calling (for the
+/// audit log) and, for stdio, where to record runs the request starts so a
+/// `notifications/cancelled` can stop them.
+pub struct CallCtx {
+    pub client: String,
+    pub peer: String,
+    pub run_sink: Option<crate::runs::RunSink>,
+}
+
+impl CallCtx {
+    /// The TCP peer plus, when present, the original client IP that Cloudflare
+    /// forwards in `Cf-Connecting-Ip`. (The header is informational only —
+    /// anything that can reach the port directly could set it.)
+    fn http(peer: std::net::SocketAddr, headers: &HeaderMap) -> Self {
+        let client = headers
+            .get("cf-connecting-ip")
+            .or_else(|| headers.get("x-forwarded-for"))
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "-".into());
+        Self { peer: peer.ip().to_string(), client, run_sink: None }
+    }
+
+    /// For the stdio transport (and protocol unit tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn stdio(run_sink: Option<crate::runs::RunSink>) -> Self {
+        Self { client: "stdio".into(), peer: "-".into(), run_sink }
+    }
+}
+
+/// `params._meta["io.modelcontextprotocol/protocolVersion"]`, which selects the
+/// 2026-07-28 era when present.
+fn protocol_version(msg: &Value) -> Option<String> {
+    msg.get("params")?
+        .get("_meta")?
+        .get("io.modelcontextprotocol/protocolVersion")?
+        .as_str()
+        .map(String::from)
+}
+
+pub type CallFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>;
+
+/// Outcome of dispatching one JSON-RPC message.
+pub enum Dispatch {
+    /// Answer available now; `None` for notifications and stray responses.
+    Reply(Option<Value>),
+    /// A validated `tools/call`; the tool already runs on its own task, so
+    /// dropping this future never kills the work.
+    Call(CallFuture),
+}
+
+/// Transport-agnostic JSON-RPC: one parsed message in, one response out
+/// (`None` for notifications). Both eras; `_meta` protocolVersion is validated
+/// here, HTTP header mirroring is not (that is the HTTP layer's job). The
+/// transports call [`dispatch`] directly, since HTTP picks SSE vs JSON for a
+/// pending call and stdio tracks in-flight calls for cancellation.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn handle_message(app: Arc<AppState>, msg: Value, ctx: CallCtx) -> Option<Value> {
+    match dispatch(app, msg, ctx) {
+        Dispatch::Reply(r) => r,
+        Dispatch::Call(f) => Some(f.await),
+    }
+}
+
+pub fn dispatch(app: Arc<AppState>, msg: Value, ctx: CallCtx) -> Dispatch {
+    let ready = |v: Value| Dispatch::Reply(Some(v));
+    if msg.is_array() {
+        return ready(rpc_err(&Value::Null, E_INVALID_REQUEST, "JSON-RPC batches are not supported", None));
+    }
+    let Some(obj) = msg.as_object() else {
+        return ready(rpc_err(&Value::Null, E_INVALID_REQUEST, "expected a JSON-RPC object", None));
+    };
+    let (Some(method), Some(id)) = (obj.get("method").and_then(Value::as_str), obj.get("id")) else {
+        // Notification (e.g. notifications/initialized) or a stray response.
+        return Dispatch::Reply(None);
+    };
+    let id = id.clone();
+    let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
+    let version = protocol_version(&msg);
+    debug!(method, ?version, "request");
+    match version {
+        Some(v) => modern(app, id, method, params, &v, ctx),
+        None => legacy(app, id, method, params, ctx),
+    }
+}
+
 /// Wrap a result for 2026-07-28: resultType + serverInfo in _meta.
 fn complete(mut r: Value) -> Value {
     if let Some(o) = r.as_object_mut() {
@@ -272,32 +361,18 @@ fn complete(mut r: Value) -> Value {
     r
 }
 
-async fn modern(
-    app: Arc<AppState>,
-    headers: &HeaderMap,
-    id: Value,
-    method: &str,
-    params: Value,
-    v: &str,
-    wants_sse: bool,
-    caller: &Caller,
-) -> Response {
+fn modern(app: Arc<AppState>, id: Value, method: &str, params: Value, v: &str, ctx: CallCtx) -> Dispatch {
+    let ready = |v: Value| Dispatch::Reply(Some(v));
     if v != MODERN {
-        return json_resp(
-            StatusCode::BAD_REQUEST,
-            rpc_err(
-                &id,
-                E_VERSION,
-                format!("Unsupported protocol version: {v}"),
-                Some(json!({"supported": [MODERN], "requested": v})),
-            ),
-        );
-    }
-    if let Some(r) = header_check(headers, &id, method, &params, v) {
-        return r;
+        return ready(rpc_err(
+            &id,
+            E_VERSION,
+            format!("Unsupported protocol version: {v}"),
+            Some(json!({"supported": [MODERN], "requested": v})),
+        ));
     }
     match method {
-        "server/discover" => json_resp(StatusCode::OK, rpc_ok(&id, complete(json!({
+        "server/discover" => ready(rpc_ok(&id, complete(json!({
             "supportedVersions": [MODERN],
             "capabilities": {"tools": {}},
             "serverInfo": server_info(),
@@ -305,113 +380,187 @@ async fn modern(
             "ttlMs": 300_000,
             "cacheScope": "private",
         })))),
-        "tools/list" => json_resp(StatusCode::OK, rpc_ok(&id, complete(json!({
+        "tools/list" => ready(rpc_ok(&id, complete(json!({
             "tools": tools::definitions(&app),
             "ttlMs": 300_000,
             "cacheScope": "private",
         })))),
-        "tools/call" => tools_call(app, id, params, wants_sse, true, caller).await,
-        _ => json_resp(
-            StatusCode::NOT_FOUND,
-            rpc_err(&id, E_METHOD, format!("Method not found: {method}"), None),
-        ),
+        "tools/call" => tools_call(app, id, params, true, ctx),
+        _ => ready(rpc_err(&id, E_METHOD, format!("Method not found: {method}"), None)),
     }
 }
 
-async fn legacy(
-    app: Arc<AppState>,
-    id: Value,
-    method: &str,
-    params: Value,
-    wants_sse: bool,
-    caller: &Caller,
-) -> Response {
+fn legacy(app: Arc<AppState>, id: Value, method: &str, params: Value, ctx: CallCtx) -> Dispatch {
+    let ready = |v: Value| Dispatch::Reply(Some(v));
     match method {
         "initialize" => {
             let req = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
             let ver = LEGACY.iter().find(|v| **v == req).copied().unwrap_or(LEGACY[0]);
-            json_resp(StatusCode::OK, rpc_ok(&id, json!({
+            ready(rpc_ok(&id, json!({
                 "protocolVersion": ver,
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": server_info(),
                 "instructions": instructions(&app),
             })))
         }
-        "ping" => json_resp(StatusCode::OK, rpc_ok(&id, json!({}))),
-        "server/discover" => json_resp(StatusCode::OK, rpc_ok(&id, complete(json!({
+        "ping" => ready(rpc_ok(&id, json!({}))),
+        "server/discover" => ready(rpc_ok(&id, complete(json!({
             "supportedVersions": [MODERN],
             "capabilities": {"tools": {}},
             "serverInfo": server_info(),
             "instructions": instructions(&app),
         })))),
-        "tools/list" => json_resp(StatusCode::OK, rpc_ok(&id, json!({"tools": tools::definitions(&app)}))),
-        "tools/call" => tools_call(app, id, params, wants_sse, false, caller).await,
-        _ => json_resp(StatusCode::OK, rpc_err(&id, E_METHOD, format!("Method not found: {method}"), None)),
+        "tools/list" => ready(rpc_ok(&id, json!({"tools": tools::definitions(&app)}))),
+        "tools/call" => tools_call(app, id, params, false, ctx),
+        _ => ready(rpc_err(&id, E_METHOD, format!("Method not found: {method}"), None)),
     }
 }
 
-async fn tools_call(
-    app: Arc<AppState>,
-    id: Value,
-    params: Value,
-    wants_sse: bool,
-    modern: bool,
-    caller: &Caller,
-) -> Response {
+fn tools_call(app: Arc<AppState>, id: Value, params: Value, modern: bool, ctx: CallCtx) -> Dispatch {
     let Some(name) = params.get("name").and_then(Value::as_str).map(String::from) else {
-        return json_resp(StatusCode::OK, rpc_err(&id, E_PARAMS, "tools/call requires params.name", None));
+        return Dispatch::Reply(Some(rpc_err(&id, E_PARAMS, "tools/call requires params.name", None)));
     };
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
     if !tools::definitions(&app).iter().any(|t| t["name"] == name.as_str()) {
-        return json_resp(StatusCode::OK, rpc_err(&id, E_PARAMS, format!("Unknown tool: {name}"), None));
+        return Dispatch::Reply(Some(rpc_err(&id, E_PARAMS, format!("Unknown tool: {name}"), None)));
     }
 
     // Audit: one line per tool call. Command text and exit status are logged by
     // the run itself (target "audit" in runs.rs), keyed by run_id.
     let s = |k: &str| args.get(k).and_then(Value::as_str).map(|v| crate::runs::truncate(v, 200));
-    info!(target: "audit", tool = %name, client = %caller.client, peer = %caller.peer,
+    info!(target: "audit", tool = %name, client = %ctx.client, peer = %ctx.peer,
           host = s("hostname").as_deref().unwrap_or("-"), path = s("path").as_deref().unwrap_or("-"),
           run_id = s("run_id").as_deref().unwrap_or("-"), "tool call");
 
     // Run the tool on its own task: if the client disconnects mid-call the
     // work (and any SSH run it started) carries on and stays reachable via list_runs.
-    let app2 = app.clone();
     let task = tokio::spawn(async move {
         let t0 = std::time::Instant::now();
-        let out = tools::call(&app2, &name, args).await;
+        let fut = tools::call(&app, &name, args);
+        let out = match ctx.run_sink {
+            Some(sink) => crate::runs::RUN_SINK.scope(sink, fut).await,
+            None => fut.await,
+        };
         debug!(tool = %name, ms = t0.elapsed().as_millis() as u64, "tool done");
         out
     });
-    let id2 = id.clone();
-    let finish = move |res: Result<Option<tools::ToolOut>, tokio::task::JoinError>| -> Value {
-        match res {
+    Dispatch::Call(Box::pin(async move {
+        match task.await {
             Ok(Some(o)) => {
                 let mut content = vec![json!({"type": "text", "text": o.text})];
                 if let Some((mime, data)) = o.image {
                     content.push(json!({"type": "image", "mimeType": mime, "data": data}));
                 }
                 let r = json!({"content": content, "isError": o.is_error});
-                rpc_ok(&id2, if modern { complete(r) } else { r })
+                rpc_ok(&id, if modern { complete(r) } else { r })
             }
-            Ok(None) => rpc_err(&id2, E_PARAMS, "Unknown tool", None),
-            Err(e) => rpc_err(&id2, -32603, format!("internal error: {e}"), None),
+            Ok(None) => rpc_err(&id, E_PARAMS, "Unknown tool", None),
+            Err(e) => rpc_err(&id, -32603, format!("internal error: {e}"), None),
         }
-    };
+    }))
+}
 
-    if wants_sse {
-        // SSE with keep-alive comments so proxies with idle timeouts
-        // (e.g. Cloudflare's ~100s) don't cut long synchronous calls.
-        let stream = async_stream::stream! {
-            let body = finish(task.await);
-            yield Ok::<Event, Infallible>(Event::default().event("message").data(body.to_string()));
-        };
-        let mut resp = Sse::new(stream)
-            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keepalive"))
-            .into_response();
-        resp.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
-        resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        resp
-    } else {
-        json_resp(StatusCode::OK, finish(task.await))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const META: &str = "io.modelcontextprotocol/protocolVersion";
+
+    async fn call(msg: Value) -> Option<Value> {
+        handle_message(crate::tests::test_app(), msg, CallCtx::stdio(None)).await
+    }
+
+    fn req(id: Value, method: &str, params: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+    }
+
+    fn modern_req(id: i64, method: &str, mut params: Value) -> Value {
+        params["_meta"] = json!({META: MODERN});
+        req(json!(id), method, params)
+    }
+
+    fn code(r: &Value) -> i64 {
+        r["error"]["code"].as_i64().expect("an error reply")
+    }
+
+    #[tokio::test]
+    async fn legacy_era() {
+        let r = call(req(json!(1), "initialize", json!({"protocolVersion": "2025-06-18"}))).await.unwrap();
+        assert_eq!(r["id"], 1);
+        assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(r["result"]["serverInfo"]["name"], "ssh-mcp-rs");
+        assert!(r["result"]["instructions"].as_str().unwrap().contains("box"));
+        // An unknown version negotiates down to the newest legacy one.
+        let r = call(req(json!(1), "initialize", json!({"protocolVersion": "1.0"}))).await.unwrap();
+        assert_eq!(r["result"]["protocolVersion"], LEGACY[0]);
+
+        let r = call(req(json!("p"), "ping", json!({}))).await.unwrap();
+        assert_eq!(r, json!({"jsonrpc": "2.0", "id": "p", "result": {}}));
+
+        let r = call(req(json!(2), "server/discover", json!({}))).await.unwrap();
+        assert_eq!(r["result"]["supportedVersions"], json!([MODERN]));
+        assert_eq!(r["result"]["resultType"], "complete");
+
+        let r = call(req(json!(3), "tools/list", json!({}))).await.unwrap();
+        let tools = r["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "execute_command"));
+        assert!(r["result"].get("resultType").is_none());
+
+        let r = call(req(json!(4), "tools/call", json!({"name": "list_hosts"}))).await.unwrap();
+        assert_eq!(r["result"]["isError"], false);
+        assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("192.0.2.1"));
+        assert!(r["result"].get("resultType").is_none());
+
+        assert_eq!(code(&call(req(json!(5), "tools/call", json!({"name": "nope"}))).await.unwrap()), E_PARAMS);
+        assert_eq!(code(&call(req(json!(6), "tools/call", json!({}))).await.unwrap()), E_PARAMS);
+        assert_eq!(code(&call(req(json!(7), "resources/list", json!({}))).await.unwrap()), E_METHOD);
+        // Tool-level failures are results with isError, not JSON-RPC errors.
+        let r = call(req(json!(8), "tools/call", json!({"name": "get_run", "arguments": {"run_id": "r0"}}))).await.unwrap();
+        assert_eq!(r["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn modern_era() {
+        let r = call(modern_req(1, "server/discover", json!({}))).await.unwrap();
+        assert_eq!(r["result"]["supportedVersions"], json!([MODERN]));
+        assert_eq!(r["result"]["ttlMs"], 300_000);
+        assert_eq!(r["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "ssh-mcp-rs");
+
+        let r = call(modern_req(2, "tools/list", json!({}))).await.unwrap();
+        assert_eq!(r["result"]["resultType"], "complete");
+        assert_eq!(r["result"]["cacheScope"], "private");
+
+        let r = call(modern_req(3, "tools/call", json!({"name": "list_runs"}))).await.unwrap();
+        assert_eq!(r["result"]["resultType"], "complete");
+        assert_eq!(r["result"]["content"][0]["text"], "no runs");
+
+        assert_eq!(code(&call(modern_req(4, "tools/call", json!({"name": "nope"}))).await.unwrap()), E_PARAMS);
+        // initialize is a legacy-era method.
+        assert_eq!(code(&call(modern_req(5, "initialize", json!({}))).await.unwrap()), E_METHOD);
+
+        let mut m = req(json!(6), "tools/list", json!({}));
+        m["params"]["_meta"] = json!({META: "2025-06-18"});
+        let r = call(m).await.unwrap();
+        assert_eq!(code(&r), E_VERSION);
+        assert_eq!(r["error"]["data"]["supported"], json!([MODERN]));
+    }
+
+    #[tokio::test]
+    async fn notifications_and_malformed() {
+        assert_eq!(call(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await, None);
+        assert_eq!(call(json!({"jsonrpc": "2.0", "id": 1, "result": {}})).await, None);
+        assert_eq!(code(&call(json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}])).await.unwrap()), E_INVALID_REQUEST);
+        assert_eq!(code(&call(json!("hello")).await.unwrap()), E_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn http_status_mapping() {
+        let e = |c: i64| rpc_err(&json!(1), c, "x", None);
+        assert_eq!(http_status(&rpc_ok(&json!(1), json!({})), true), StatusCode::OK);
+        assert_eq!(http_status(&e(E_VERSION), true), StatusCode::BAD_REQUEST);
+        assert_eq!(http_status(&e(E_INVALID_REQUEST), false), StatusCode::BAD_REQUEST);
+        assert_eq!(http_status(&e(E_METHOD), true), StatusCode::NOT_FOUND);
+        assert_eq!(http_status(&e(E_METHOD), false), StatusCode::OK);
+        assert_eq!(http_status(&e(E_PARAMS), true), StatusCode::OK);
     }
 }

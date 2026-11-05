@@ -254,6 +254,23 @@ fn new_id(n: u64) -> String {
 
 // ---------------------------------------------------------------- manager
 
+/// Runs started while serving one request. The stdio transport scopes each
+/// `tools/call` in [`RUN_SINK`] so `notifications/cancelled` can stop the runs
+/// that request started. A tool call starts at most a couple of runs.
+#[derive(Default)]
+pub struct RequestRuns {
+    pub ids: Vec<String>,
+    /// The client cancelled the request: runs it starts from now on are
+    /// cancelled immediately (they never execute).
+    pub cancelled: bool,
+}
+
+pub type RunSink = Arc<Mutex<RequestRuns>>;
+
+tokio::task_local! {
+    pub static RUN_SINK: RunSink;
+}
+
 pub struct Runs {
     pool: Arc<Pool>,
     cfg: Arc<Config>,
@@ -320,6 +337,16 @@ impl Runs {
             cancel: CancellationToken::new(),
         });
         self.map.lock().unwrap().insert(run.id.clone(), run.clone());
+        let cancelled = RUN_SINK
+            .try_with(|s| {
+                let mut s = s.lock().unwrap_or_else(|p| p.into_inner());
+                s.ids.push(run.id.clone());
+                s.cancelled
+            })
+            .unwrap_or(false);
+        if cancelled {
+            run.cancel.cancel();
+        }
         info!(target: "audit", run = %run.id, host = %run.target.alias, user = %run.target.user,
               sudo = run.sudo, cmd = ?truncate(&run.command, 2000), "run started");
         let me = self.clone();

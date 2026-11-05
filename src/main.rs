@@ -109,3 +109,35 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// An AppState with a throwaway client key and no reachable hosts, for
+    /// protocol tests that never open an SSH connection.
+    pub(crate) fn test_app() -> Arc<AppState> {
+        use russh::keys::ssh_key::{LineEnding, PrivateKey, private::Ed25519Keypair};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ssh-mcp-rs-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]));
+        let key_file = dir.join("id_ed25519");
+        std::fs::write(&key_file, key.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "key_file = {:?}\nlearned_hosts_file = {:?}\n[hosts.box]\naddress = \"192.0.2.1\"\n",
+            key_file,
+            dir.join("learned")
+        ))
+        .unwrap();
+        let cfg = Arc::new(cfg);
+        let pool = Arc::new(Pool::new(cfg.clone()).unwrap());
+        let runs = Runs::new(pool.clone(), cfg.clone());
+        Arc::new(AppState { cfg, pool, runs, started: Instant::now() })
+    }
+}
