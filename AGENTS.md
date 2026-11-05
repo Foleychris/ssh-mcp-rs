@@ -33,8 +33,13 @@ auth bypass, injection or host-key weakness is critical**.
 ```
 cargo build --release
 cargo test --release          # unit tests; must pass, the Docker build runs them too
-cargo clippy --release        # don't add new warnings in code you touch
+cargo clippy --release --all-targets -- -D warnings   # CI fails on any warning
+cargo fmt                     # CI and the pre-commit hook reject unformatted code
 ```
+
+Enable the pre-commit hook once per clone: `git config core.hooksPath .githooks`.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and `cargo package`, and
+builds with the MSRV (Rust 1.89).
 
 Run a dev server on a spare loopback port with your own config:
 
