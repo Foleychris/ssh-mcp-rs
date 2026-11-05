@@ -17,10 +17,18 @@ pub struct ToolOut {
 }
 
 pub fn ok(text: String) -> ToolOut {
-    ToolOut { text, is_error: false, image: None }
+    ToolOut {
+        text,
+        is_error: false,
+        image: None,
+    }
 }
 pub fn err(text: impl Into<String>) -> ToolOut {
-    ToolOut { text: text.into(), is_error: true, image: None }
+    ToolOut {
+        text: text.into(),
+        is_error: true,
+        image: None,
+    }
 }
 
 pub fn definitions(app: &AppState) -> Vec<Value> {
@@ -36,7 +44,11 @@ pub fn definitions(app: &AppState) -> Vec<Value> {
     let host_desc = format!(
         "Target host. Configured: {}.{}",
         hosts.join(", "),
-        if app.cfg.allow_unlisted_hosts { " Other hostnames/IPs are also accepted." } else { "" }
+        if app.cfg.allow_unlisted_hosts {
+            " Other hostnames/IPs are also accepted."
+        } else {
+            ""
+        }
     );
     let user_desc = "SSH user (optional; defaults to the host's configured user).";
     let l = &app.cfg.limits;
@@ -229,7 +241,9 @@ pub fn status_line(run: &Run) -> String {
         ),
     };
     if matches!(s.status, Status::Cancelled | Status::TimedOut) && s.unkillable {
-        out.push_str(" — WARNING: could not signal the process (pid unknown); it may still be running");
+        out.push_str(
+            " — WARNING: could not signal the process (pid unknown); it may still be running",
+        );
     }
     if matches!(s.status, Status::Cancelled | Status::TimedOut) {
         if let Some(c) = s.exit_code {
@@ -258,10 +272,20 @@ fn render(app: &AppState, run: &Run, show_cmd: bool) -> String {
         let _ = write!(t, "\nnote: {n}");
     }
     if s.stdout.total > 0 {
-        let _ = write!(t, "\n--- stdout ({} B) ---\n{}", s.stdout.total, s.stdout.view(limit, "stdout_offset").trim_end_matches('\n'));
+        let _ = write!(
+            t,
+            "\n--- stdout ({} B) ---\n{}",
+            s.stdout.total,
+            s.stdout.view(limit, "stdout_offset").trim_end_matches('\n')
+        );
     }
     if s.stderr.total > 0 {
-        let _ = write!(t, "\n--- stderr ({} B) ---\n{}", s.stderr.total, s.stderr.view(limit, "stderr_offset").trim_end_matches('\n'));
+        let _ = write!(
+            t,
+            "\n--- stderr ({} B) ---\n{}",
+            s.stderr.total,
+            s.stderr.view(limit, "stderr_offset").trim_end_matches('\n')
+        );
     }
     if s.stdout.total == 0 && s.stderr.total == 0 && s.status.terminal() {
         t.push_str("\n(no output)");
@@ -333,7 +357,10 @@ async fn execute_command(app: &Arc<AppState>, args: Value) -> ToolOut {
     if a.command.trim().is_empty() {
         return err("command is empty");
     }
-    if a.command.contains('\0') || a.username.as_deref().is_some_and(|u| u.contains('\0')) || a.hostname.contains('\0') {
+    if a.command.contains('\0')
+        || a.username.as_deref().is_some_and(|u| u.contains('\0'))
+        || a.hostname.contains('\0')
+    {
         return err("command, hostname and username must not contain NUL bytes");
     }
     let target = match app.pool.resolve(&a.hostname, a.username.as_deref()) {
@@ -373,10 +400,17 @@ async fn execute_command(app: &Arc<AppState>, args: Value) -> ToolOut {
             run.target.alias, run.id, run.id
         ));
     }
-    let wait = a.wait_secs.unwrap_or(l.default_wait_secs).min(l.max_wait_secs);
+    let wait = a
+        .wait_secs
+        .unwrap_or(l.default_wait_secs)
+        .min(l.max_wait_secs);
     run.wait(Duration::from_secs(wait)).await;
     let failed = matches!(run.state().status, Status::Failed);
-    ToolOut { text: render(app, &run, false), is_error: failed, image: None }
+    ToolOut {
+        text: render(app, &run, false),
+        is_error: failed,
+        image: None,
+    }
 }
 
 // ---------------------------------------------------------------- runs
@@ -407,7 +441,8 @@ async fn get_run(app: &Arc<AppState>, args: Value) -> ToolOut {
         ));
     };
     if let Some(w) = a.wait_secs.filter(|w| *w > 0) {
-        run.wait(Duration::from_secs(w.min(app.cfg.limits.max_wait_secs))).await;
+        run.wait(Duration::from_secs(w.min(app.cfg.limits.max_wait_secs)))
+            .await;
     }
     if a.stdout_offset.is_none() && a.stderr_offset.is_none() {
         return ok(render(app, &run, true));
@@ -428,9 +463,16 @@ async fn get_run(app: &Arc<AppState>, args: Value) -> ToolOut {
         let Some(off) = off else { continue };
         let (start, chunk) = buf.read_from(off, max);
         let next = start + chunk.len() as u64;
-        let _ = write!(t, "\n--- {name} bytes {start}..{next} of {} (next_offset={next}) ---", buf.total);
+        let _ = write!(
+            t,
+            "\n--- {name} bytes {start}..{next} of {} (next_offset={next}) ---",
+            buf.total
+        );
         if start > off {
-            let _ = write!(t, "\n(note: bytes {off}..{start} were dropped from the retention window)");
+            let _ = write!(
+                t,
+                "\n(note: bytes {off}..{start} were dropped from the retention window)"
+            );
         }
         let _ = write!(t, "\n{}", String::from_utf8_lossy(chunk));
     }
@@ -464,7 +506,10 @@ fn list_runs(app: &Arc<AppState>, args: Value) -> ToolOut {
         .list()
         .into_iter()
         .filter(|r| !a.active_only || !r.is_done())
-        .filter(|r| host.as_deref().is_none_or(|h| r.target.alias.eq_ignore_ascii_case(h)))
+        .filter(|r| {
+            host.as_deref()
+                .is_none_or(|h| r.target.alias.eq_ignore_ascii_case(h))
+        })
         .take(limit)
         .collect();
     if runs.is_empty() {
@@ -571,10 +616,11 @@ async fn write_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         let _ = write!(cmd, "chmod {m} -- {p}; ");
     }
     let _ = write!(cmd, "wc -c < {p}");
-    let (run, out, errs) = match crate::fileops::run_collect(app, target, cmd, a.sudo, Some(data), 64).await {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    let (run, out, errs) =
+        match crate::fileops::run_collect(app, target, cmd, a.sudo, Some(data), 64).await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
     if !crate::fileops::succeeded(&run) {
         return crate::fileops::failure(&run, "write", &errs);
     }
@@ -627,14 +673,22 @@ async fn server_info(app: &Arc<AppState>, args: Value) -> ToolOut {
         Ok(t) => t,
         Err(e) => return err(format!("{e:#}")),
     };
-    match app.pool.exec_collect(&target, INFO_SCRIPT, Duration::from_secs(30), false).await {
+    match app
+        .pool
+        .exec_collect(&target, INFO_SCRIPT, Duration::from_secs(30), false)
+        .await
+    {
         Ok((_, out, e)) => ok(format!(
             "System information for {} ({}@{})\n\n{}{}",
             target.alias,
             target.user,
             target.address,
             out.trim_end(),
-            if e.trim().is_empty() { String::new() } else { format!("\n\n(stderr)\n{}", e.trim_end()) }
+            if e.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n\n(stderr)\n{}", e.trim_end())
+            }
         )),
         Err(e) => err(format!("{e:#}")),
     }
@@ -652,7 +706,12 @@ async fn test_conn(app: &Arc<AppState>, args: Value) -> ToolOut {
     let t0 = std::time::Instant::now();
     match app
         .pool
-        .exec_collect(&target, "echo ok; whoami; hostname", Duration::from_secs(30), false)
+        .exec_collect(
+            &target,
+            "echo ok; whoami; hostname",
+            Duration::from_secs(30),
+            false,
+        )
         .await
     {
         Ok((Some(0), out, _)) => {
@@ -667,7 +726,9 @@ async fn test_conn(app: &Arc<AppState>, args: Value) -> ToolOut {
                 t0.elapsed().as_secs_f64() * 1000.0
             ))
         }
-        Ok((code, out, e)) => err(format!("connected but test command failed ({code:?}): {out}{e}")),
+        Ok((code, out, e)) => err(format!(
+            "connected but test command failed ({code:?}): {out}{e}"
+        )),
         Err(e) => err(format!("❌ {}: {e:#}", target.alias)),
     }
 }
@@ -681,14 +742,21 @@ fn list_hosts(app: &Arc<AppState>) -> ToolOut {
             h.user.as_deref().unwrap_or(&app.cfg.default_user),
             h.address,
             h.port.unwrap_or(app.cfg.default_port),
-            h.description.as_deref().map(|d| format!("  — {d}")).unwrap_or_default()
+            h.description
+                .as_deref()
+                .map(|d| format!("  — {d}"))
+                .unwrap_or_default()
         );
     }
     let stats = app.pool.stats();
     if !stats.is_empty() {
         t.push_str("\nConnection pool:\n");
         for s in stats {
-            let _ = writeln!(t, "  {:<40} conns={} channels_in_use={}", s.key, s.conns, s.in_use);
+            let _ = writeln!(
+                t,
+                "  {:<40} conns={} channels_in_use={}",
+                s.key, s.conns, s.in_use
+            );
         }
     }
     let _ = write!(t, "\nActive runs: {}", app.runs.active_count());

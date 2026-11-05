@@ -216,7 +216,12 @@ impl Run {
         let found = scan
             .windows(PID_MARKER.len())
             .position(|w| w == PID_MARKER)
-            .and_then(|i| scan[i..].iter().position(|&c| c == b'\n').map(|nl| (i, i + nl)));
+            .and_then(|i| {
+                scan[i..]
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map(|nl| (i, i + nl))
+            });
         if let Some((i, nl)) = found {
             s.pid = std::str::from_utf8(&scan[i + PID_MARKER.len()..nl])
                 .ok()
@@ -248,7 +253,9 @@ fn wrap(cmd: &str, sudo: bool) -> String {
 }
 
 fn new_id(n: u64) -> String {
-    let r = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    let r = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
     format!("r{n}-{:06x}", r & 0xff_ffff)
 }
 
@@ -370,7 +377,12 @@ impl Runs {
     }
 
     pub fn active_count(&self) -> usize {
-        self.map.lock().unwrap().values().filter(|r| !r.is_done()).count()
+        self.map
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| !r.is_done())
+            .count()
     }
 
     pub fn spawn_reaper(self: &Arc<Self>) {
@@ -401,7 +413,14 @@ impl Runs {
         let mut drop_n = done.len().saturating_sub(max);
         // Memory budget across finished runs: evict oldest until under it.
         let budget = self.cfg.limits.retained_budget_bytes;
-        let held = |id: &String| m.get(id).map(|r| { let s = r.state(); s.stdout.held() + s.stderr.held() }).unwrap_or(0);
+        let held = |id: &String| {
+            m.get(id)
+                .map(|r| {
+                    let s = r.state();
+                    s.stdout.held() + s.stderr.held()
+                })
+                .unwrap_or(0)
+        };
         let mut total: usize = done.iter().map(|(_, id)| held(id)).sum();
         for (_, id) in done.iter().take(drop_n) {
             total -= held(id);
@@ -411,7 +430,11 @@ impl Runs {
             drop_n += 1;
         }
         if drop_n > 0 {
-            info!(evicted = drop_n, retained_bytes = total, "reaped finished runs");
+            info!(
+                evicted = drop_n,
+                retained_bytes = total,
+                "reaped finished runs"
+            );
         }
         for (_, id) in done.iter().take(drop_n) {
             m.remove(id);
@@ -434,7 +457,13 @@ impl Runs {
             _ = run.cancel.cancelled() => None,
         };
         let (lease, ch) = match opened {
-            None => return self.finish(&run, Some(Status::Cancelled), Some("cancelled while queued".into())),
+            None => {
+                return self.finish(
+                    &run,
+                    Some(Status::Cancelled),
+                    Some("cancelled while queued".into()),
+                );
+            }
             Some(Err(e)) => return self.finish(&run, Some(Status::Failed), Some(format!("{e:#}"))),
             Some(Ok(v)) => v,
         };
@@ -445,7 +474,11 @@ impl Runs {
         if permit.is_none() || run.cancel.is_cancelled() {
             drop(ch);
             drop(lease);
-            return self.finish(&run, Some(Status::Cancelled), Some("cancelled while queued".into()));
+            return self.finish(
+                &run,
+                Some(Status::Cancelled),
+                Some("cancelled while queued".into()),
+            );
         }
         {
             let mut s = run.state();
@@ -460,7 +493,10 @@ impl Runs {
         };
         self.finish(&run, status, err);
         drop(permit);
-        let big = { let s = run.state(); s.stdout.held() + s.stderr.held() > 16 * 1024 * 1024 };
+        let big = {
+            let s = run.state();
+            s.stdout.held() + s.stderr.held() > 16 * 1024 * 1024
+        };
         if big {
             self.reap_soon();
         }
@@ -477,7 +513,8 @@ impl Runs {
                 Some(st) => st,
                 None if s.exit_code.is_some() || s.signal.is_some() => Status::Exited,
                 None => {
-                    s.error.get_or_insert_with(|| "channel closed without exit status".into());
+                    s.error
+                        .get_or_insert_with(|| "channel closed without exit status".into());
                     Status::Failed
                 }
             };
@@ -514,7 +551,10 @@ impl Runs {
         let t = run.target.clone();
         let id = run.id.clone();
         tokio::spawn(async move {
-            match pool.exec_collect(&t, &cmd, Duration::from_secs(15), true).await {
+            match pool
+                .exec_collect(&t, &cmd, Duration::from_secs(15), true)
+                .await
+            {
                 Ok((code, _, err)) => {
                     info!(run = %id, sig, ?code, err = %err.trim(), "signal sent")
                 }

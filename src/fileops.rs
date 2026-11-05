@@ -54,7 +54,15 @@ pub(crate) async fn run_collect(
 ) -> Result<(Arc<Run>, Vec<u8>, String), ToolOut> {
     let run = app
         .runs
-        .start(target, cmd, StartOpts { sudo, stdin, timeout: Some(Duration::from_secs(120)) })
+        .start(
+            target,
+            cmd,
+            StartOpts {
+                sudo,
+                stdin,
+                timeout: Some(Duration::from_secs(120)),
+            },
+        )
         .map_err(err)?;
     if !run.wait(Duration::from_secs(130)).await {
         app.runs.cancel(&run);
@@ -68,7 +76,9 @@ pub(crate) async fn run_collect(
     let s = run.state();
     if s.stdout.dropped() > 0 {
         drop(s);
-        return Err(err("output exceeded the server's retention window; refusing to use a partial read"));
+        return Err(err(
+            "output exceeded the server's retention window; refusing to use a partial read",
+        ));
     }
     let out = s.stdout.read_from(0, max_out).1.to_vec();
     let errs = String::from_utf8_lossy(s.stderr.read_from(0, 16 * 1024).1).into_owned();
@@ -82,8 +92,17 @@ pub(crate) fn succeeded(run: &Run) -> bool {
 }
 
 pub(crate) fn failure(run: &Run, what: &str, errs: &str) -> ToolOut {
-    let why = errs.lines().filter(|l| !l.starts_with("META ")).collect::<Vec<_>>().join(" ");
-    err(format!("[{}] {what} failed: {} {}", run.target.alias, status_line(run), why.trim()))
+    let why = errs
+        .lines()
+        .filter(|l| !l.starts_with("META "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    err(format!(
+        "[{}] {what} failed: {} {}",
+        run.target.alias,
+        status_line(run),
+        why.trim()
+    ))
 }
 
 /// Common shell preamble: existence / type / permission checks with clear exits.
@@ -94,7 +113,9 @@ fn checks(p: &str, need_write: bool) -> String {
          [ -r {p} ] || {{ echo 'permission denied (try sudo=true)' >&2; exit 4; }}; "
     );
     if need_write {
-        c.push_str(&format!("[ -w {p} ] || {{ echo 'not writable (try sudo=true)' >&2; exit 4; }}; "));
+        c.push_str(&format!(
+            "[ -w {p} ] || {{ echo 'not writable (try sudo=true)' >&2; exit 4; }}; "
+        ));
     }
     c
 }
@@ -150,7 +171,11 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
     let len = a.length.unwrap_or(READ_DEFAULT).clamp(1, READ_MAX);
     // In auto mode a plain read from offset 0 fetches enough to return a whole
     // image; non-image content is still trimmed to `len` below.
-    let fetch = if enc == "auto" && a.offset == 0 && a.length.is_none() { IMAGE_MAX } else { len };
+    let fetch = if enc == "auto" && a.offset == 0 && a.length.is_none() {
+        IMAGE_MAX
+    } else {
+        len
+    };
     let p = sh_quote(&a.path);
     let cmd = format!(
         "set -e; {}echo \"META $(stat -L -c '%s|%A|%U:%G|%y' -- {p} 2>/dev/null || wc -c < {p})\" >&2; \
@@ -158,14 +183,20 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         checks(&p, false),
         a.offset + 1
     );
-    let (run, mut data, errs) = match run_collect(app, target, cmd, a.sudo, None, fetch as usize).await {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    let (run, mut data, errs) =
+        match run_collect(app, target, cmd, a.sudo, None, fetch as usize).await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
     if !succeeded(&run) {
         return failure(&run, "read", &errs);
     }
-    let meta = errs.lines().find_map(|l| l.strip_prefix("META ")).unwrap_or("").trim().to_string();
+    let meta = errs
+        .lines()
+        .find_map(|l| l.strip_prefix("META "))
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let mut f = meta.split('|');
     let size: Option<u64> = f.next().and_then(|v| v.trim().parse().ok());
     let rest: Vec<&str> = f.collect();
@@ -177,7 +208,11 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
             a.offset,
             a.offset + n,
             size.map(|v| v.to_string()).unwrap_or("?".into()),
-            if eof { " (EOF)".to_string() } else { format!(" (next_offset={})", a.offset + n) }
+            if eof {
+                " (EOF)".to_string()
+            } else {
+                format!(" (next_offset={})", a.offset + n)
+            }
         );
         if !rest.is_empty() {
             let _ = write!(t, "\n{}", rest.join("  "));
@@ -187,23 +222,34 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
 
     // Whole image -> image content block the model can look at.
     let whole = a.offset == 0 && size.is_some_and(|sz| sz == data.len() as u64);
-    if enc == "auto" && whole
+    if enc == "auto"
+        && whole
         && let Some(mime) = image_mime(&data)
     {
         let n = data.len() as u64;
-        let mut out = ok(format!("{}\n--- image ({mime}, {n} bytes) attached ---", header(n, true)));
-        out.image = Some((mime.to_string(), base64::engine::general_purpose::STANDARD.encode(&data)));
+        let mut out = ok(format!(
+            "{}\n--- image ({mime}, {n} bytes) attached ---",
+            header(n, true)
+        ));
+        out.image = Some((
+            mime.to_string(),
+            base64::engine::general_purpose::STANDARD.encode(&data),
+        ));
         return out;
     }
     let image_note = if enc == "auto" && a.offset == 0 && image_mime(&data).is_some() {
-        format!(" — image larger than {} MiB, returned as base64 chunks", IMAGE_MAX / 1024 / 1024)
+        format!(
+            " — image larger than {} MiB, returned as base64 chunks",
+            IMAGE_MAX / 1024 / 1024
+        )
     } else {
         String::new()
     };
     data.truncate(len as usize);
     // A chunk boundary may split a multi-byte character: in auto mode, end the
     // chunk at the last complete character and let next_offset resume there.
-    if enc == "auto" && image_note.is_empty()
+    if enc == "auto"
+        && image_note.is_empty()
         && let Err(e) = std::str::from_utf8(&data)
     {
         let at_eof = size.is_some_and(|sz| a.offset + data.len() as u64 >= sz);
@@ -217,7 +263,10 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         "base64" => None,
         "utf8" | "utf-8" => Some(String::from_utf8_lossy(&data).into_owned()),
         _ if !image_note.is_empty() => None,
-        _ => std::str::from_utf8(&data).ok().filter(|t| !t.contains('\0')).map(str::to_string),
+        _ => std::str::from_utf8(&data)
+            .ok()
+            .filter(|t| !t.contains('\0'))
+            .map(str::to_string),
     };
     let mut t = header(n, eof);
     match as_text {
@@ -228,7 +277,11 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
             let _ = write!(
                 t,
                 "\n--- base64 ({n} bytes{}{image_note}) ---\n{}",
-                if enc == "auto" && image_note.is_empty() { "; not valid UTF-8 text" } else { "" },
+                if enc == "auto" && image_note.is_empty() {
+                    "; not valid UTF-8 text"
+                } else {
+                    ""
+                },
                 base64::engine::general_purpose::STANDARD.encode(&data)
             );
         }
@@ -287,21 +340,34 @@ fn select_edits(
             return Err("`replace_all` goes on each entry of `edits`, not at the top level".into());
         }
         (Some(list), None, None) => list,
-        (None, Some(o), Some(n)) => vec![Edit { old_string: o, new_string: n, replace_all }],
-        (Some(_), _, _) => return Err("pass either `edits` or `old_string`/`new_string`, not both".into()),
+        (None, Some(o), Some(n)) => vec![Edit {
+            old_string: o,
+            new_string: n,
+            replace_all,
+        }],
+        (Some(_), _, _) => {
+            return Err("pass either `edits` or `old_string`/`new_string`, not both".into());
+        }
         _ => return Err("pass `old_string` and `new_string`, or an `edits` list".into()),
     };
     if list.is_empty() {
         return Err("`edits` is empty".into());
     }
     if list.len() > MAX_EDITS {
-        return Err(format!("too many edits in one call ({}; max {MAX_EDITS})", list.len()));
+        return Err(format!(
+            "too many edits in one call ({}; max {MAX_EDITS})",
+            list.len()
+        ));
     }
     Ok(list)
 }
 
 fn line_of(text: &str, byte: usize) -> usize {
-    text.as_bytes()[..byte.min(text.len())].iter().filter(|&&b| b == b'\n').count() + 1
+    text.as_bytes()[..byte.min(text.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
 }
 
 fn floor_cb(s: &str, i: usize) -> usize {
@@ -347,7 +413,10 @@ fn context(text: &str, start: usize, end: usize, around: usize) -> String {
     let last = line_of(text, end.max(start));
     let lo = first.saturating_sub(around).max(1);
     let hi = (last + around).min(lines.len());
-    let line_start = text.as_bytes()[..start].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let line_start = text.as_bytes()[..start]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
     let col = start - line_start;
     let mut out = String::new();
     for (shown, ln) in (lo..=hi).enumerate() {
@@ -356,7 +425,11 @@ fn context(text: &str, start: usize, end: usize, around: usize) -> String {
             break;
         }
         let mark = if ln >= first && ln <= last { '>' } else { ' ' };
-        let _ = writeln!(out, "{mark}{ln:>5}  {}", clip(lines[ln - 1], if ln == first { col } else { 0 }));
+        let _ = writeln!(
+            out,
+            "{mark}{ln:>5}  {}",
+            clip(lines[ln - 1], if ln == first { col } else { 0 })
+        );
     }
     out
 }
@@ -386,18 +459,34 @@ fn merge(a: Vec<Span>, b: Vec<Span>) -> Vec<Span> {
 /// intermediate result larger than `max` bytes. Returns the new text, the
 /// replaced regions in final-text coordinates (sorted), and the total number
 /// of replacements. Linear in text size + replacements per edit.
-fn apply_edits(text: &str, edits: &[Edit], max: usize) -> Result<(String, Vec<Span>, usize), String> {
+fn apply_edits(
+    text: &str,
+    edits: &[Edit],
+    max: usize,
+) -> Result<(String, Vec<Span>, usize), String> {
     let n = edits.len();
-    let label = |k: usize| if n == 1 { String::new() } else { format!("edit {} of {n}: ", k + 1) };
+    let label = |k: usize| {
+        if n == 1 {
+            String::new()
+        } else {
+            format!("edit {} of {n}: ", k + 1)
+        }
+    };
     let mut cur = text.to_string();
     let mut spans: Vec<Span> = Vec::new();
     let mut total = 0;
     for (k, e) in edits.iter().enumerate() {
         if e.old_string.is_empty() {
-            return Err(format!("{}old_string is empty (use write_file to create or overwrite a file)", label(k)));
+            return Err(format!(
+                "{}old_string is empty (use write_file to create or overwrite a file)",
+                label(k)
+            ));
         }
         if e.old_string == e.new_string {
-            return Err(format!("{}old_string and new_string are identical", label(k)));
+            return Err(format!(
+                "{}old_string and new_string are identical",
+                label(k)
+            ));
         }
         let hits: Vec<usize> = cur.match_indices(&e.old_string).map(|(i, _)| i).collect();
         if hits.is_empty() {
@@ -406,7 +495,10 @@ fn apply_edits(text: &str, edits: &[Edit], max: usize) -> Result<(String, Vec<Sp
                 " (it matched the original file, but an earlier edit in this batch changed that text — edits apply in order)"
             } else if !t.is_empty() && t != e.old_string && cur.contains(t) {
                 " (it does match after trimming leading/trailing whitespace — check indentation and line endings)"
-            } else if cur.contains("\r\n") && e.old_string.contains('\n') && !e.old_string.contains("\r\n") {
+            } else if cur.contains("\r\n")
+                && e.old_string.contains('\n')
+                && !e.old_string.contains("\r\n")
+            {
                 " (the file uses CRLF line endings)"
             } else {
                 ""
@@ -414,7 +506,11 @@ fn apply_edits(text: &str, edits: &[Edit], max: usize) -> Result<(String, Vec<Sp
             return Err(format!("{}old_string not found{hint}", label(k)));
         }
         if hits.len() > 1 && !e.replace_all {
-            let lines: Vec<String> = hits.iter().take(10).map(|&i| line_of(&cur, i).to_string()).collect();
+            let lines: Vec<String> = hits
+                .iter()
+                .take(10)
+                .map(|&i| line_of(&cur, i).to_string())
+                .collect();
             return Err(format!(
                 "{}old_string matches {} times (lines {}{}); add surrounding context to make it unique, or set replace_all",
                 label(k),
@@ -499,14 +595,28 @@ pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
         checks(&p, true),
         lim = EDIT_MAX + 1
     );
-    let (run, data, errs) = match run_collect(app, target.clone(), read_cmd, a.sudo, None, EDIT_MAX as usize + 1).await {
+    let (run, data, errs) = match run_collect(
+        app,
+        target.clone(),
+        read_cmd,
+        a.sudo,
+        None,
+        EDIT_MAX as usize + 1,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => return e,
     };
     if !succeeded(&run) {
         return failure(&run, "edit (read)", &errs);
     }
-    let meta = errs.lines().find_map(|l| l.strip_prefix("META ")).unwrap_or("").trim().to_string();
+    let meta = errs
+        .lines()
+        .find_map(|l| l.strip_prefix("META "))
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let mut mf = meta.split_whitespace();
     let sha = mf.next().unwrap_or("").to_string();
     let snap_len: Option<usize> = mf.next().and_then(|v| v.parse().ok());
@@ -533,11 +643,17 @@ pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
 
     // 2. Apply every edit in memory (off the async workers: it is CPU work);
     // any failure means nothing is written.
-    let applied = tokio::task::spawn_blocking(move || apply_edits(&text, &edits, EDIT_MAX as usize)).await;
+    let applied =
+        tokio::task::spawn_blocking(move || apply_edits(&text, &edits, EDIT_MAX as usize)).await;
     let (out, spans, total) = match applied {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return err(format!("edit: {e}. Nothing was changed in {}.", a.path)),
-        Err(e) => return err(format!("edit: internal error while applying edits ({e}); nothing was changed in {}", a.path)),
+        Err(e) => {
+            return err(format!(
+                "edit: internal error while applying edits ({e}); nothing was changed in {}",
+                a.path
+            ));
+        }
     };
     let expected = out.len();
 
@@ -551,7 +667,16 @@ pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
          {copy}wc -c < {p}",
         copy = copy_staged(&p, false)
     );
-    let (wrun, wout, werrs) = match run_collect(app, target, write_cmd, a.sudo, Some(out.clone().into_bytes()), 64).await {
+    let (wrun, wout, werrs) = match run_collect(
+        app,
+        target,
+        write_cmd,
+        a.sudo,
+        Some(out.clone().into_bytes()),
+        64,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -576,11 +701,25 @@ pub async fn edit_file(app: &Arc<AppState>, args: Value) -> ToolOut {
     );
     const SHOW: usize = 5;
     for &(s, e, k) in spans.iter().take(SHOW) {
-        let tag = if n_edits == 1 { String::new() } else { format!(" (edit {k})") };
-        let _ = write!(t, "\n--- line {}{tag} ---\n{}", line_of(&out, s), context(&out, s, e.saturating_sub(1).max(s), 2).trim_end());
+        let tag = if n_edits == 1 {
+            String::new()
+        } else {
+            format!(" (edit {k})")
+        };
+        let _ = write!(
+            t,
+            "\n--- line {}{tag} ---\n{}",
+            line_of(&out, s),
+            context(&out, s, e.saturating_sub(1).max(s), 2).trim_end()
+        );
     }
     if spans.len() > SHOW {
-        let _ = write!(t, "\n… and {} more change{}", spans.len() - SHOW, if spans.len() - SHOW == 1 { "" } else { "s" });
+        let _ = write!(
+            t,
+            "\n… and {} more change{}",
+            spans.len() - SHOW,
+            if spans.len() - SHOW == 1 { "" } else { "s" }
+        );
     }
     if t.len() > REPORT_MAX {
         let cut = floor_cb(&t, REPORT_MAX);
@@ -598,10 +737,17 @@ mod tests {
     use super::*;
     const BIG: usize = 1 << 30;
     fn e(o: &str, n: &str) -> Edit {
-        Edit { old_string: o.into(), new_string: n.into(), replace_all: false }
+        Edit {
+            old_string: o.into(),
+            new_string: n.into(),
+            replace_all: false,
+        }
     }
     fn ea(o: &str, n: &str) -> Edit {
-        Edit { replace_all: true, ..e(o, n) }
+        Edit {
+            replace_all: true,
+            ..e(o, n)
+        }
     }
     fn ap(text: &str, edits: &[Edit]) -> Result<(String, Vec<Span>, usize), String> {
         apply_edits(text, edits, BIG)
@@ -626,20 +772,29 @@ mod tests {
     #[test]
     fn failure_is_all_or_nothing_and_names_the_edit() {
         let r = ap("a b", &[e("a", "A"), e("zzz", "Z")]);
-        assert!(r.unwrap_err().starts_with("edit 2 of 2: old_string not found"));
+        assert!(
+            r.unwrap_err()
+                .starts_with("edit 2 of 2: old_string not found")
+        );
     }
 
     #[test]
     fn hint_when_earlier_edit_consumed_text() {
         let r = ap("foo bar", &[e("foo bar", "baz"), e("bar", "qux")]).unwrap_err();
-        assert!(r.contains("earlier edit in this batch changed that text"), "{r}");
+        assert!(
+            r.contains("earlier edit in this batch changed that text"),
+            "{r}"
+        );
     }
 
     #[test]
     fn ambiguous_without_replace_all() {
         let r = ap("p=1\np=1\n", &[e("p=1", "p=2")]).unwrap_err();
         assert!(r.contains("matches 2 times (lines 1, 2)"), "{r}");
-        assert_eq!(ap("p=1\np=1\n", &[ea("p=1", "p=2")]).unwrap().0, "p=2\np=2\n");
+        assert_eq!(
+            ap("p=1\np=1\n", &[ea("p=1", "p=2")]).unwrap().0,
+            "p=2\np=2\n"
+        );
     }
 
     #[test]
@@ -702,7 +857,10 @@ mod tests {
         let r = ap("a b c", &[e("a", "A"), e("", "x")]).unwrap_err();
         assert!(r.starts_with("edit 2 of 2: old_string is empty"), "{r}");
         let r = ap("a b c", &[e("a", "A"), e("c", "c")]).unwrap_err();
-        assert!(r.starts_with("edit 2 of 2: old_string and new_string are identical"), "{r}");
+        assert!(
+            r.starts_with("edit 2 of 2: old_string and new_string are identical"),
+            "{r}"
+        );
         let r = ap("a b c", &[e("zz", "y")]).unwrap_err();
         assert!(r.starts_with("old_string not found"), "{r}");
     }
@@ -710,7 +868,10 @@ mod tests {
     #[test]
     fn ambiguity_created_by_earlier_edit() {
         let r = ap("a b", &[e("a", "b"), e("b", "c")]).unwrap_err();
-        assert!(r.starts_with("edit 2 of 2: old_string matches 2 times (lines 1, 1)"), "{r}");
+        assert!(
+            r.starts_with("edit 2 of 2: old_string matches 2 times (lines 1, 1)"),
+            "{r}"
+        );
     }
 
     #[test]
@@ -738,7 +899,10 @@ mod tests {
         let text = "a".repeat(1024);
         let edits: Vec<Edit> = (0..13).map(|_| ea("a", "aa")).collect();
         let r = apply_edits(&text, &edits, 1 << 20).unwrap_err();
-        assert!(r.starts_with("edit 11 of 13: the result would be 2097152 bytes"), "{r}");
+        assert!(
+            r.starts_with("edit 11 of 13: the result would be 2097152 bytes"),
+            "{r}"
+        );
     }
 
     #[test]
@@ -746,7 +910,11 @@ mod tests {
         let text = "a\n".repeat(200_000);
         let t0 = std::time::Instant::now();
         let (out, spans, total) = ap(&text, &[ea("a", "b"), ea("\n", "\r\n")]).unwrap();
-        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            t0.elapsed()
+        );
         assert_eq!(out.len(), 600_000);
         assert_eq!((spans.len(), total), (400_000, 400_000));
         assert!(spans.windows(2).all(|w| w[0] <= w[1]));
@@ -758,7 +926,10 @@ mod tests {
         let c = context(text, 6, 6, 2);
         let lines: Vec<&str> = c.lines().collect();
         assert_eq!(lines.len(), 5, "{c}");
-        assert!(lines[0].ends_with("  2") && lines[4].ends_with("  6"), "{c}");
+        assert!(
+            lines[0].ends_with("  2") && lines[4].ends_with("  6"),
+            "{c}"
+        );
         let marked: Vec<&&str> = lines.iter().filter(|l| l.starts_with('>')).collect();
         assert_eq!(marked, vec![&">    4  4"]);
     }
@@ -786,11 +957,26 @@ mod tests {
     #[test]
     fn argument_forms() {
         let one = || Some(vec![e("a", "b")]);
-        assert!(select_edits(one(), Some("a".into()), Some("b".into()), false).unwrap_err().contains("not both"));
-        assert!(select_edits(one(), None, None, true).unwrap_err().contains("top level"));
-        assert_eq!(select_edits(Some(vec![]), None, None, false).unwrap_err(), "`edits` is empty");
+        assert!(
+            select_edits(one(), Some("a".into()), Some("b".into()), false)
+                .unwrap_err()
+                .contains("not both")
+        );
+        assert!(
+            select_edits(one(), None, None, true)
+                .unwrap_err()
+                .contains("top level")
+        );
+        assert_eq!(
+            select_edits(Some(vec![]), None, None, false).unwrap_err(),
+            "`edits` is empty"
+        );
         let many: Vec<Edit> = (0..201).map(|_| e("a", "b")).collect();
-        assert!(select_edits(Some(many), None, None, false).unwrap_err().contains("too many edits"));
+        assert!(
+            select_edits(Some(many), None, None, false)
+                .unwrap_err()
+                .contains("too many edits")
+        );
         assert!(select_edits(None, Some("a".into()), None, false).is_err());
         let v = select_edits(None, Some("a".into()), Some("b".into()), true).unwrap();
         assert!(v.len() == 1 && v[0].replace_all);
@@ -799,7 +985,9 @@ mod tests {
 
     #[test]
     fn unknown_edit_fields_rejected() {
-        let r = serde_json::from_value::<Edit>(serde_json::json!({"old_string": "a", "new_string": "b", "replaceAll": true}));
+        let r = serde_json::from_value::<Edit>(
+            serde_json::json!({"old_string": "a", "new_string": "b", "replaceAll": true}),
+        );
         assert!(r.is_err());
     }
 }

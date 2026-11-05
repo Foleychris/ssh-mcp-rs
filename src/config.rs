@@ -177,7 +177,9 @@ fn d_policy() -> HostKeyPolicy {
 
 /// Expand a leading `~` or `~/` with `home`. `~user` forms are left alone.
 fn expand_tilde(p: &Path, home: Option<&str>) -> PathBuf {
-    let Some(home) = home.filter(|h| !h.is_empty()) else { return p.to_path_buf() };
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return p.to_path_buf();
+    };
     match p.to_str() {
         Some("~") => PathBuf::from(home),
         Some(s) if s.starts_with("~/") => Path::new(home).join(&s[2..]),
@@ -200,7 +202,10 @@ impl Config {
         cfg.learned_hosts_file = ex(&cfg.learned_hosts_file);
         cfg.known_hosts_files = cfg.known_hosts_files.iter().map(|p| ex(p)).collect();
         if cfg.default_user.trim().is_empty() {
-            bail!("default_user is not set and $USER is empty; set default_user in {}", path.display());
+            bail!(
+                "default_user is not set and $USER is empty; set default_user in {}",
+                path.display()
+            );
         }
         match mode {
             Mode::Http => cfg.http_auth_checks()?,
@@ -208,17 +213,24 @@ impl Config {
             Mode::Stdio => cfg.auth_token = None,
         }
         for f in &cfg.known_hosts_files {
-            std::fs::File::open(f)
-                .with_context(|| format!("known_hosts file {} is missing or unreadable", f.display()))?;
+            std::fs::File::open(f).with_context(|| {
+                format!("known_hosts file {} is missing or unreadable", f.display())
+            })?;
         }
         let l = &cfg.limits;
-        if l.channels_per_conn == 0 || l.max_conns_per_host == 0 || l.max_concurrent_runs == 0 || l.max_pending_runs == 0 {
+        if l.channels_per_conn == 0
+            || l.max_conns_per_host == 0
+            || l.max_concurrent_runs == 0
+            || l.max_pending_runs == 0
+        {
             bail!("limits must be non-zero");
         }
         // File tools read whole files (edit_file up to 4 MiB, images up to 5 MiB)
         // through the run output buffer, which drops oldest bytes beyond this.
         if l.retained_output_bytes < 6 * 1024 * 1024 {
-            bail!("limits.retained_output_bytes must be at least 6 MiB (file tools read whole files through it)");
+            bail!(
+                "limits.retained_output_bytes must be at least 6 MiB (file tools read whole files through it)"
+            );
         }
         if l.retained_output_bytes < l.inline_output_bytes {
             bail!("limits.retained_output_bytes must be >= limits.inline_output_bytes");
@@ -226,7 +238,9 @@ impl Config {
         let cap = max_wait_cap(mode);
         if l.max_wait_secs > cap {
             match mode {
-                Mode::Http => bail!("limits.max_wait_secs must be <= {cap} (claude.ai times out tool calls at ~230s)"),
+                Mode::Http => bail!(
+                    "limits.max_wait_secs must be <= {cap} (claude.ai times out tool calls at ~230s)"
+                ),
                 Mode::Stdio => bail!("limits.max_wait_secs must be <= {cap} in stdio mode"),
             }
         }
@@ -245,7 +259,9 @@ impl Config {
         if let Ok(p) = std::env::var("SSH_MCP_TOKEN_FILE") {
             let t = std::fs::read_to_string(&p).with_context(|| format!("reading {p}"))?;
             if t.trim().is_empty() {
-                bail!("SSH_MCP_TOKEN_FILE {p} is empty — refusing to start without the shared secret");
+                bail!(
+                    "SSH_MCP_TOKEN_FILE {p} is empty — refusing to start without the shared secret"
+                );
             }
             cfg.auth_token = Some(t.trim().to_string());
         }
@@ -258,7 +274,10 @@ impl Config {
         if let Some(t) = &cfg.auth_token
             && t.len() < 32
         {
-            bail!("auth_token is only {} characters; use at least 32 (e.g. `openssl rand -hex 32`)", t.len());
+            bail!(
+                "auth_token is only {} characters; use at least 32 (e.g. `openssl rand -hex 32`)",
+                t.len()
+            );
         }
         let loopback = cfg
             .listen
@@ -285,18 +304,26 @@ mod tests {
         let h = Some("/home/me");
         let e = |p: &str| expand_tilde(Path::new(p), h);
         assert_eq!(e("~"), PathBuf::from("/home/me"));
-        assert_eq!(e("~/.ssh/id_ed25519"), PathBuf::from("/home/me/.ssh/id_ed25519"));
+        assert_eq!(
+            e("~/.ssh/id_ed25519"),
+            PathBuf::from("/home/me/.ssh/id_ed25519")
+        );
         assert_eq!(e("/etc/x"), PathBuf::from("/etc/x"));
         assert_eq!(e("~other/x"), PathBuf::from("~other/x"));
         assert_eq!(e("a/~/b"), PathBuf::from("a/~/b"));
         assert_eq!(expand_tilde(Path::new("~/x"), None), PathBuf::from("~/x"));
-        assert_eq!(expand_tilde(Path::new("~/x"), Some("")), PathBuf::from("~/x"));
+        assert_eq!(
+            expand_tilde(Path::new("~/x"), Some("")),
+            PathBuf::from("~/x")
+        );
     }
 
     #[test]
     fn safe_defaults() {
         assert_eq!(d_policy(), HostKeyPolicy::Strict);
-        let cfg: Config = toml::from_str("default_user = \"u\"\nkey_file = \"k\"\nlearned_hosts_file = \"l\"\n").unwrap();
+        let cfg: Config =
+            toml::from_str("default_user = \"u\"\nkey_file = \"k\"\nlearned_hosts_file = \"l\"\n")
+                .unwrap();
         assert_eq!(cfg.host_key_policy, HostKeyPolicy::Strict);
         assert_eq!(cfg.stdio_on_exit, OnExit::Cancel);
         assert_eq!(cfg.listen, "127.0.0.1:8011");

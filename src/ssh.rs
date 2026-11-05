@@ -76,9 +76,13 @@ impl KeyCheck {
         }
         let mut recorded_types: Vec<String> = Vec::new();
         for f in files {
-            let entries = russh::keys::known_hosts::known_host_keys_path(host, port, f).map_err(|e| {
-                format!("cannot read known_hosts {} ({e}); refusing to connect to {host}:{port}", f.display())
-            })?;
+            let entries =
+                russh::keys::known_hosts::known_host_keys_path(host, port, f).map_err(|e| {
+                    format!(
+                        "cannot read known_hosts {} ({e}); refusing to connect to {host}:{port}",
+                        f.display()
+                    )
+                })?;
             for (line, recorded) in entries {
                 if recorded == *key {
                     return Ok(());
@@ -273,7 +277,11 @@ impl Pool {
     /// a host whose channel slots are all held by long-running commands.
     fn host_pool(&self, t: &Target, control: bool) -> Arc<HostPool> {
         let mut m = self.hosts.lock().unwrap();
-        let key = if control { format!("ctl|{}", t.key()) } else { t.key() };
+        let key = if control {
+            format!("ctl|{}", t.key())
+        } else {
+            t.key()
+        };
         m.entry(key)
             .or_insert_with(|| {
                 let l = &self.cfg.limits;
@@ -368,12 +376,18 @@ impl Pool {
                 Err(e) => {
                     if lease.conn.handle.is_closed() {
                         // Stale connection: drop it from the pool and retry on a fresh one.
-                        warn!(conn = lease.conn.id, attempt, "channel open failed on closed connection: {e}");
+                        warn!(
+                            conn = lease.conn.id,
+                            attempt, "channel open failed on closed connection: {e}"
+                        );
                         lease.conn.dead.store(true, Ordering::Relaxed);
                     } else {
                         // Live connection refused the channel — typically sshd MaxSessions
                         // momentarily exceeded while closed channels are still being torn down.
-                        warn!(conn = lease.conn.id, attempt, "channel open refused (sshd MaxSessions?): {e}");
+                        warn!(
+                            conn = lease.conn.id,
+                            attempt, "channel open refused (sshd MaxSessions?): {e}"
+                        );
                         drop(lease);
                         tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
                     }

@@ -53,7 +53,13 @@ fn instructions(app: &AppState) -> String {
         .cfg
         .hosts
         .iter()
-        .map(|(k, h)| format!("{k} ({}@{})", h.user.as_deref().unwrap_or(&app.cfg.default_user), h.address))
+        .map(|(k, h)| {
+            format!(
+                "{k} ({}@{})",
+                h.user.as_deref().unwrap_or(&app.cfg.default_user),
+                h.address
+            )
+        })
         .collect();
     format!(
         "Run commands on remote hosts over SSH. Hosts: {}. \
@@ -73,7 +79,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn origin_ok(app: &AppState, origin: &str) -> bool {
-    if app.cfg.allowed_origins.iter().any(|o| o == origin || o == "*") {
+    if app
+        .cfg
+        .allowed_origins
+        .iter()
+        .any(|o| o == origin || o == "*")
+    {
         return true;
     }
     let rest = origin.split("://").nth(1).unwrap_or("");
@@ -92,7 +103,9 @@ fn authorized(app: &AppState, tok: &str, uri: &axum::http::Uri, headers: &Header
     let ok = |p: &str| constant_time_eq(p.trim().as_bytes(), tok.as_bytes());
     let hv = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
     if let Some(a) = hv("authorization")
-        && a.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("bearer ")) && ok(&a[7..])
+        && a.get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
+        && ok(&a[7..])
     {
         return true;
     }
@@ -115,7 +128,10 @@ fn authorized(app: &AppState, tok: &str, uri: &axum::http::Uri, headers: &Header
 
 /// Decode the `=?base64?…?=` sentinel form used by Mcp-Name / Mcp-Param-*.
 fn decode_header_value(v: &str) -> Option<String> {
-    match v.strip_prefix("=?base64?").and_then(|r| r.strip_suffix("?=")) {
+    match v
+        .strip_prefix("=?base64?")
+        .and_then(|r| r.strip_suffix("?="))
+    {
         Some(b) => base64::engine::general_purpose::STANDARD
             .decode(b)
             .ok()
@@ -138,7 +154,10 @@ pub async fn gate(
     if let Some(tok) = &app.cfg.auth_token
         && !authorized(&app, tok, uri, headers)
     {
-        let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-");
+        let ua = headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
         warn!(target: "audit", client = %caller.client, peer = %caller.peer, user_agent = %crate::runs::truncate(ua, 120),
               "rejected request: missing or wrong shared secret");
         return (
@@ -161,7 +180,6 @@ pub async fn gate(
     }
     next.run(req).await
 }
-
 
 // ---------------------------------------------------------------- HTTP transport
 
@@ -199,12 +217,11 @@ pub async fn handle(
     if let (Some(v), Some(obj)) = (version.as_deref(), msg.as_object())
         && v == MODERN
         && let (Some(method), Some(id)) = (obj.get("method").and_then(Value::as_str), obj.get("id"))
-
     {
         let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
         if let Some(r) = header_check(&headers, id, method, &params, v) {
-        return r;
-    }
+            return r;
+        }
     }
     let wants_sse = headers
         .get(header::ACCEPT)
@@ -223,27 +240,52 @@ pub async fn handle(
                 yield Ok::<Event, Infallible>(Event::default().event("message").data(body.to_string()));
             };
             let mut resp = Sse::new(stream)
-                .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keepalive"))
+                .keep_alive(
+                    KeepAlive::new()
+                        .interval(Duration::from_secs(15))
+                        .text("keepalive"),
+                )
                 .into_response();
-            resp.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
-            resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            resp.headers_mut()
+                .insert("x-accel-buffering", HeaderValue::from_static("no"));
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             resp
         }
         Dispatch::Call(fut) => json_resp(StatusCode::OK, fut.await),
     }
 }
 
-fn header_check(headers: &HeaderMap, id: &Value, method: &str, params: &Value, v: &str) -> Option<Response> {
+fn header_check(
+    headers: &HeaderMap,
+    id: &Value,
+    method: &str,
+    params: &Value,
+    v: &str,
+) -> Option<Response> {
     let hv = |n: &str| headers.get(n).and_then(|x| x.to_str().ok());
-    let bad = |m: String| Some(json_resp(StatusCode::BAD_REQUEST, rpc_err(id, E_HEADER, m, None)));
+    let bad = |m: String| {
+        Some(json_resp(
+            StatusCode::BAD_REQUEST,
+            rpc_err(id, E_HEADER, m, None),
+        ))
+    };
     match hv("mcp-protocol-version") {
         Some(h) if h == v => {}
-        Some(h) => return bad(format!("Header mismatch: MCP-Protocol-Version '{h}' does not match body '{v}'")),
+        Some(h) => {
+            return bad(format!(
+                "Header mismatch: MCP-Protocol-Version '{h}' does not match body '{v}'"
+            ));
+        }
         None => return bad("Missing required header: MCP-Protocol-Version".into()),
     }
     match hv("mcp-method") {
         Some(h) if h == method => {}
-        Some(h) => return bad(format!("Header mismatch: Mcp-Method '{h}' does not match body '{method}'")),
+        Some(h) => {
+            return bad(format!(
+                "Header mismatch: Mcp-Method '{h}' does not match body '{method}'"
+            ));
+        }
         None => return bad("Missing required header: Mcp-Method".into()),
     }
     if matches!(method, "tools/call" | "resources/read" | "prompts/get") {
@@ -256,7 +298,10 @@ fn header_check(headers: &HeaderMap, id: &Value, method: &str, params: &Value, v
             (None, _) => return bad("Missing required header: Mcp-Name".into()),
             (Some(None), _) => return bad("Malformed Mcp-Name header".into()),
             (Some(Some(h)), b) => {
-                return bad(format!("Header mismatch: Mcp-Name '{h}' does not match body '{}'", b.unwrap_or("")));
+                return bad(format!(
+                    "Header mismatch: Mcp-Name '{h}' does not match body '{}'",
+                    b.unwrap_or("")
+                ));
             }
         }
     }
@@ -286,11 +331,19 @@ impl CallCtx {
             .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "-".into());
-        Self { peer: peer.ip().to_string(), client, run_sink: None }
+        Self {
+            peer: peer.ip().to_string(),
+            client,
+            run_sink: None,
+        }
     }
 
     pub fn stdio(run_sink: Option<crate::runs::RunSink>) -> Self {
-        Self { client: "stdio".into(), peer: "-".into(), run_sink }
+        Self {
+            client: "stdio".into(),
+            peer: "-".into(),
+            run_sink,
+        }
     }
 }
 
@@ -331,12 +384,23 @@ pub async fn handle_message(app: Arc<AppState>, msg: Value, ctx: CallCtx) -> Opt
 pub fn dispatch(app: Arc<AppState>, msg: Value, ctx: CallCtx) -> Dispatch {
     let ready = |v: Value| Dispatch::Reply(Some(v));
     if msg.is_array() {
-        return ready(rpc_err(&Value::Null, E_INVALID_REQUEST, "JSON-RPC batches are not supported", None));
+        return ready(rpc_err(
+            &Value::Null,
+            E_INVALID_REQUEST,
+            "JSON-RPC batches are not supported",
+            None,
+        ));
     }
     let Some(obj) = msg.as_object() else {
-        return ready(rpc_err(&Value::Null, E_INVALID_REQUEST, "expected a JSON-RPC object", None));
+        return ready(rpc_err(
+            &Value::Null,
+            E_INVALID_REQUEST,
+            "expected a JSON-RPC object",
+            None,
+        ));
     };
-    let (Some(method), Some(id)) = (obj.get("method").and_then(Value::as_str), obj.get("id")) else {
+    let (Some(method), Some(id)) = (obj.get("method").and_then(Value::as_str), obj.get("id"))
+    else {
         // Notification (e.g. notifications/initialized) or a stray response.
         return Dispatch::Reply(None);
     };
@@ -360,7 +424,14 @@ fn complete(mut r: Value) -> Value {
     r
 }
 
-fn modern(app: Arc<AppState>, id: Value, method: &str, params: Value, v: &str, ctx: CallCtx) -> Dispatch {
+fn modern(
+    app: Arc<AppState>,
+    id: Value,
+    method: &str,
+    params: Value,
+    v: &str,
+    ctx: CallCtx,
+) -> Dispatch {
     let ready = |v: Value| Dispatch::Reply(Some(v));
     if v != MODERN {
         return ready(rpc_err(
@@ -371,21 +442,32 @@ fn modern(app: Arc<AppState>, id: Value, method: &str, params: Value, v: &str, c
         ));
     }
     match method {
-        "server/discover" => ready(rpc_ok(&id, complete(json!({
-            "supportedVersions": [MODERN],
-            "capabilities": {"tools": {}},
-            "serverInfo": server_info(),
-            "instructions": instructions(&app),
-            "ttlMs": 300_000,
-            "cacheScope": "private",
-        })))),
-        "tools/list" => ready(rpc_ok(&id, complete(json!({
-            "tools": tools::definitions(&app),
-            "ttlMs": 300_000,
-            "cacheScope": "private",
-        })))),
+        "server/discover" => ready(rpc_ok(
+            &id,
+            complete(json!({
+                "supportedVersions": [MODERN],
+                "capabilities": {"tools": {}},
+                "serverInfo": server_info(),
+                "instructions": instructions(&app),
+                "ttlMs": 300_000,
+                "cacheScope": "private",
+            })),
+        )),
+        "tools/list" => ready(rpc_ok(
+            &id,
+            complete(json!({
+                "tools": tools::definitions(&app),
+                "ttlMs": 300_000,
+                "cacheScope": "private",
+            })),
+        )),
         "tools/call" => tools_call(app, id, params, true, ctx),
-        _ => ready(rpc_err(&id, E_METHOD, format!("Method not found: {method}"), None)),
+        _ => ready(rpc_err(
+            &id,
+            E_METHOD,
+            format!("Method not found: {method}"),
+            None,
+        )),
     }
 }
 
@@ -393,40 +475,81 @@ fn legacy(app: Arc<AppState>, id: Value, method: &str, params: Value, ctx: CallC
     let ready = |v: Value| Dispatch::Reply(Some(v));
     match method {
         "initialize" => {
-            let req = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
-            let ver = LEGACY.iter().find(|v| **v == req).copied().unwrap_or(LEGACY[0]);
-            ready(rpc_ok(&id, json!({
-                "protocolVersion": ver,
-                "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": server_info(),
-                "instructions": instructions(&app),
-            })))
+            let req = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let ver = LEGACY
+                .iter()
+                .find(|v| **v == req)
+                .copied()
+                .unwrap_or(LEGACY[0]);
+            ready(rpc_ok(
+                &id,
+                json!({
+                    "protocolVersion": ver,
+                    "capabilities": {"tools": {"listChanged": false}},
+                    "serverInfo": server_info(),
+                    "instructions": instructions(&app),
+                }),
+            ))
         }
         "ping" => ready(rpc_ok(&id, json!({}))),
-        "server/discover" => ready(rpc_ok(&id, complete(json!({
-            "supportedVersions": [MODERN],
-            "capabilities": {"tools": {}},
-            "serverInfo": server_info(),
-            "instructions": instructions(&app),
-        })))),
+        "server/discover" => ready(rpc_ok(
+            &id,
+            complete(json!({
+                "supportedVersions": [MODERN],
+                "capabilities": {"tools": {}},
+                "serverInfo": server_info(),
+                "instructions": instructions(&app),
+            })),
+        )),
         "tools/list" => ready(rpc_ok(&id, json!({"tools": tools::definitions(&app)}))),
         "tools/call" => tools_call(app, id, params, false, ctx),
-        _ => ready(rpc_err(&id, E_METHOD, format!("Method not found: {method}"), None)),
+        _ => ready(rpc_err(
+            &id,
+            E_METHOD,
+            format!("Method not found: {method}"),
+            None,
+        )),
     }
 }
 
-fn tools_call(app: Arc<AppState>, id: Value, params: Value, modern: bool, ctx: CallCtx) -> Dispatch {
+fn tools_call(
+    app: Arc<AppState>,
+    id: Value,
+    params: Value,
+    modern: bool,
+    ctx: CallCtx,
+) -> Dispatch {
     let Some(name) = params.get("name").and_then(Value::as_str).map(String::from) else {
-        return Dispatch::Reply(Some(rpc_err(&id, E_PARAMS, "tools/call requires params.name", None)));
+        return Dispatch::Reply(Some(rpc_err(
+            &id,
+            E_PARAMS,
+            "tools/call requires params.name",
+            None,
+        )));
     };
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-    if !tools::definitions(&app).iter().any(|t| t["name"] == name.as_str()) {
-        return Dispatch::Reply(Some(rpc_err(&id, E_PARAMS, format!("Unknown tool: {name}"), None)));
+    if !tools::definitions(&app)
+        .iter()
+        .any(|t| t["name"] == name.as_str())
+    {
+        return Dispatch::Reply(Some(rpc_err(
+            &id,
+            E_PARAMS,
+            format!("Unknown tool: {name}"),
+            None,
+        )));
     }
 
     // Audit: one line per tool call. Command text and exit status are logged by
     // the run itself (target "audit" in runs.rs), keyed by run_id.
-    let s = |k: &str| args.get(k).and_then(Value::as_str).map(|v| crate::runs::truncate(v, 200));
+    let s = |k: &str| {
+        args.get(k)
+            .and_then(Value::as_str)
+            .map(|v| crate::runs::truncate(v, 200))
+    };
     info!(target: "audit", tool = %name, client = %ctx.client, peer = %ctx.peer,
           host = s("hostname").as_deref().unwrap_or("-"), path = s("path").as_deref().unwrap_or("-"),
           run_id = s("run_id").as_deref().unwrap_or("-"), "tool call");
@@ -484,19 +607,38 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_era() {
-        let r = call(req(json!(1), "initialize", json!({"protocolVersion": "2025-06-18"}))).await.unwrap();
+        let r = call(req(
+            json!(1),
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        ))
+        .await
+        .unwrap();
         assert_eq!(r["id"], 1);
         assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(r["result"]["serverInfo"]["name"], "sshmux-mcp");
-        assert!(r["result"]["instructions"].as_str().unwrap().contains("box"));
+        assert!(
+            r["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("box")
+        );
         // An unknown version negotiates down to the newest legacy one.
-        let r = call(req(json!(1), "initialize", json!({"protocolVersion": "1.0"}))).await.unwrap();
+        let r = call(req(
+            json!(1),
+            "initialize",
+            json!({"protocolVersion": "1.0"}),
+        ))
+        .await
+        .unwrap();
         assert_eq!(r["result"]["protocolVersion"], LEGACY[0]);
 
         let r = call(req(json!("p"), "ping", json!({}))).await.unwrap();
         assert_eq!(r, json!({"jsonrpc": "2.0", "id": "p", "result": {}}));
 
-        let r = call(req(json!(2), "server/discover", json!({}))).await.unwrap();
+        let r = call(req(json!(2), "server/discover", json!({})))
+            .await
+            .unwrap();
         assert_eq!(r["result"]["supportedVersions"], json!([MODERN]));
         assert_eq!(r["result"]["resultType"], "complete");
 
@@ -505,37 +647,84 @@ mod tests {
         assert!(tools.iter().any(|t| t["name"] == "execute_command"));
         assert!(r["result"].get("resultType").is_none());
 
-        let r = call(req(json!(4), "tools/call", json!({"name": "list_hosts"}))).await.unwrap();
+        let r = call(req(json!(4), "tools/call", json!({"name": "list_hosts"})))
+            .await
+            .unwrap();
         assert_eq!(r["result"]["isError"], false);
-        assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("192.0.2.1"));
+        assert!(
+            r["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("192.0.2.1")
+        );
         assert!(r["result"].get("resultType").is_none());
 
-        assert_eq!(code(&call(req(json!(5), "tools/call", json!({"name": "nope"}))).await.unwrap()), E_PARAMS);
-        assert_eq!(code(&call(req(json!(6), "tools/call", json!({}))).await.unwrap()), E_PARAMS);
-        assert_eq!(code(&call(req(json!(7), "resources/list", json!({}))).await.unwrap()), E_METHOD);
+        assert_eq!(
+            code(
+                &call(req(json!(5), "tools/call", json!({"name": "nope"})))
+                    .await
+                    .unwrap()
+            ),
+            E_PARAMS
+        );
+        assert_eq!(
+            code(&call(req(json!(6), "tools/call", json!({}))).await.unwrap()),
+            E_PARAMS
+        );
+        assert_eq!(
+            code(
+                &call(req(json!(7), "resources/list", json!({})))
+                    .await
+                    .unwrap()
+            ),
+            E_METHOD
+        );
         // Tool-level failures are results with isError, not JSON-RPC errors.
-        let r = call(req(json!(8), "tools/call", json!({"name": "get_run", "arguments": {"run_id": "r0"}}))).await.unwrap();
+        let r = call(req(
+            json!(8),
+            "tools/call",
+            json!({"name": "get_run", "arguments": {"run_id": "r0"}}),
+        ))
+        .await
+        .unwrap();
         assert_eq!(r["result"]["isError"], true);
     }
 
     #[tokio::test]
     async fn modern_era() {
-        let r = call(modern_req(1, "server/discover", json!({}))).await.unwrap();
+        let r = call(modern_req(1, "server/discover", json!({})))
+            .await
+            .unwrap();
         assert_eq!(r["result"]["supportedVersions"], json!([MODERN]));
         assert_eq!(r["result"]["ttlMs"], 300_000);
-        assert_eq!(r["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "sshmux-mcp");
+        assert_eq!(
+            r["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "sshmux-mcp"
+        );
 
         let r = call(modern_req(2, "tools/list", json!({}))).await.unwrap();
         assert_eq!(r["result"]["resultType"], "complete");
         assert_eq!(r["result"]["cacheScope"], "private");
 
-        let r = call(modern_req(3, "tools/call", json!({"name": "list_runs"}))).await.unwrap();
+        let r = call(modern_req(3, "tools/call", json!({"name": "list_runs"})))
+            .await
+            .unwrap();
         assert_eq!(r["result"]["resultType"], "complete");
         assert_eq!(r["result"]["content"][0]["text"], "no runs");
 
-        assert_eq!(code(&call(modern_req(4, "tools/call", json!({"name": "nope"}))).await.unwrap()), E_PARAMS);
+        assert_eq!(
+            code(
+                &call(modern_req(4, "tools/call", json!({"name": "nope"})))
+                    .await
+                    .unwrap()
+            ),
+            E_PARAMS
+        );
         // initialize is a legacy-era method.
-        assert_eq!(code(&call(modern_req(5, "initialize", json!({}))).await.unwrap()), E_METHOD);
+        assert_eq!(
+            code(&call(modern_req(5, "initialize", json!({}))).await.unwrap()),
+            E_METHOD
+        );
 
         let mut m = req(json!(6), "tools/list", json!({}));
         m["params"]["_meta"] = json!({META: "2025-06-18"});
@@ -546,18 +735,40 @@ mod tests {
 
     #[tokio::test]
     async fn notifications_and_malformed() {
-        assert_eq!(call(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await, None);
-        assert_eq!(call(json!({"jsonrpc": "2.0", "id": 1, "result": {}})).await, None);
-        assert_eq!(code(&call(json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}])).await.unwrap()), E_INVALID_REQUEST);
-        assert_eq!(code(&call(json!("hello")).await.unwrap()), E_INVALID_REQUEST);
+        assert_eq!(
+            call(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await,
+            None
+        );
+        assert_eq!(
+            call(json!({"jsonrpc": "2.0", "id": 1, "result": {}})).await,
+            None
+        );
+        assert_eq!(
+            code(
+                &call(json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}]))
+                    .await
+                    .unwrap()
+            ),
+            E_INVALID_REQUEST
+        );
+        assert_eq!(
+            code(&call(json!("hello")).await.unwrap()),
+            E_INVALID_REQUEST
+        );
     }
 
     #[test]
     fn http_status_mapping() {
         let e = |c: i64| rpc_err(&json!(1), c, "x", None);
-        assert_eq!(http_status(&rpc_ok(&json!(1), json!({})), true), StatusCode::OK);
+        assert_eq!(
+            http_status(&rpc_ok(&json!(1), json!({})), true),
+            StatusCode::OK
+        );
         assert_eq!(http_status(&e(E_VERSION), true), StatusCode::BAD_REQUEST);
-        assert_eq!(http_status(&e(E_INVALID_REQUEST), false), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            http_status(&e(E_INVALID_REQUEST), false),
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(http_status(&e(E_METHOD), true), StatusCode::NOT_FOUND);
         assert_eq!(http_status(&e(E_METHOD), false), StatusCode::OK);
         assert_eq!(http_status(&e(E_PARAMS), true), StatusCode::OK);

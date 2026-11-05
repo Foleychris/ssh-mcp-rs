@@ -42,9 +42,12 @@ fn rpc_err(id: &Value, code: i64, msg: impl Into<String>) -> Value {
 
 pub async fn serve(app: Arc<AppState>) -> anyhow::Result<()> {
     let ppid = std::os::unix::process::parent_id();
-    info!(hosts = app.cfg.hosts.len(), ppid,
-          "sshmux-mcp serving MCP on stdio: no network listener and no network-facing auth \
-           (listen, auth_token and allowed_origins are ignored); the parent process is the client");
+    info!(
+        hosts = app.cfg.hosts.len(),
+        ppid,
+        "sshmux-mcp serving MCP on stdio: no network listener and no network-facing auth \
+           (listen, auth_token and allowed_origins are ignored); the parent process is the client"
+    );
     info!(target: "audit", client = "stdio", ppid, "stdio session started");
     let input = BufReader::new(tokio::io::stdin());
     run(app, input, tokio::io::stdout(), crate::shutdown_signal()).await;
@@ -54,8 +57,12 @@ pub async fn serve(app: Arc<AppState>) -> anyhow::Result<()> {
 }
 
 /// One stdio session: read until EOF or `stop`, then drain and clean up.
-pub async fn run<R, W>(app: Arc<AppState>, mut input: R, output: W, stop: impl std::future::Future<Output = ()>)
-where
+pub async fn run<R, W>(
+    app: Arc<AppState>,
+    mut input: R,
+    output: W,
+    stop: impl std::future::Future<Output = ()>,
+) where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -90,7 +97,11 @@ where
         w = read => w,
         _ = stop => "signal",
     };
-    info!(reason = why, inflight = s.tracker.len(), "stdio: shutting down");
+    info!(
+        reason = why,
+        inflight = s.tracker.len(),
+        "stdio: shutting down"
+    );
     s.shutdown().await;
     drop(s);
     // Tasks still holding a sender would keep the writer open; don't wait forever.
@@ -121,7 +132,11 @@ impl Session {
         }
         let msg: Value = match serde_json::from_slice(line) {
             Ok(v) => v,
-            Err(e) => return self.send(rpc_err(&Value::Null, E_PARSE, format!("Parse error: {e}"))).await,
+            Err(e) => {
+                return self
+                    .send(rpc_err(&Value::Null, E_PARSE, format!("Parse error: {e}")))
+                    .await;
+            }
         };
         let method = msg.get("method").and_then(Value::as_str);
         let id = msg.get("id").cloned();
@@ -131,7 +146,9 @@ impl Session {
         let (Some(_), Some(id)) = (method, id) else {
             // Other notifications (notifications/initialized, …), responses to
             // requests we never send, or malformed messages: dispatch decides.
-            if let Dispatch::Reply(Some(r)) = mcp::dispatch(self.app.clone(), msg, CallCtx::stdio(None)) {
+            if let Dispatch::Reply(Some(r)) =
+                mcp::dispatch(self.app.clone(), msg, CallCtx::stdio(None))
+            {
                 self.send(r).await;
             }
             return;
@@ -145,9 +162,13 @@ impl Session {
             // long-polls. Runs themselves are capped by max_pending_runs too.
             let cap = self.app.cfg.limits.max_pending_runs;
             if m.contains_key(&key) {
-                Some(format!("request id {key} is already in use by an in-flight request"))
+                Some(format!(
+                    "request id {key} is already in use by an in-flight request"
+                ))
             } else if m.len() >= cap {
-                Some(format!("too many requests in flight ({cap}); wait for some to finish"))
+                Some(format!(
+                    "too many requests in flight ({cap}); wait for some to finish"
+                ))
             } else {
                 m.insert(key.clone(), sink.clone());
                 None
@@ -184,9 +205,14 @@ impl Session {
     /// request started (same path as cancel_run). Unknown or finished ids are
     /// ignored, as the spec requires.
     fn cancel(&self, params: &Value) {
-        let Some(req) = params.get("requestId") else { return };
+        let Some(req) = params.get("requestId") else {
+            return;
+        };
         let key = req.to_string();
-        let reason = params.get("reason").and_then(Value::as_str).map(|r| crate::runs::truncate(r, 200));
+        let reason = params
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(|r| crate::runs::truncate(r, 200));
         let Some(sink) = lock(&self.inflight).get(&key).cloned() else {
             debug!(request = %key, "cancel for an unknown or finished request; ignored");
             return;
@@ -208,10 +234,23 @@ impl Session {
 
     async fn shutdown(&self) {
         self.tracker.close();
-        if tokio::time::timeout(DRAIN, self.tracker.wait()).await.is_err() {
-            info!(pending = self.tracker.len(), "stdio: requests still in flight after {}s", DRAIN.as_secs());
+        if tokio::time::timeout(DRAIN, self.tracker.wait())
+            .await
+            .is_err()
+        {
+            info!(
+                pending = self.tracker.len(),
+                "stdio: requests still in flight after {}s",
+                DRAIN.as_secs()
+            );
         }
-        let active: Vec<_> = self.app.runs.list().into_iter().filter(|r| !r.is_done()).collect();
+        let active: Vec<_> = self
+            .app
+            .runs
+            .list()
+            .into_iter()
+            .filter(|r| !r.is_done())
+            .collect();
         match self.app.cfg.stdio_on_exit {
             OnExit::Leave => {
                 for r in &active {
@@ -287,7 +326,11 @@ pub async fn read_line<R: AsyncBufRead + Unpin>(r: &mut R, max: usize) -> std::i
         let used = nl.map_or(chunk.len(), |i| i + 1);
         r.consume(used);
         if nl.is_some() {
-            return Ok(if seen > max { Line::TooLong(seen) } else { Line::Msg(buf) });
+            return Ok(if seen > max {
+                Line::TooLong(seen)
+            } else {
+                Line::Msg(buf)
+            });
         }
     }
 }
@@ -318,7 +361,10 @@ mod tests {
         assert_eq!(lines(b"\n\n", 10).await, vec![m(""), m("")]);
         assert_eq!(lines(b"0123456789\n", 10).await, vec![m("0123456789")]);
         // Over the limit: discarded through the newline, then reading continues.
-        assert_eq!(lines(b"0123456789X\nok\n", 10).await, vec![Line::TooLong(11), m("ok")]);
+        assert_eq!(
+            lines(b"0123456789X\nok\n", 10).await,
+            vec![Line::TooLong(11), m("ok")]
+        );
         assert_eq!(lines(b"0123456789XYZ", 10).await, vec![Line::TooLong(13)]);
         assert_eq!(lines(b"a\r\n", 10).await, vec![m("a\r")]);
     }
@@ -327,15 +373,28 @@ mod tests {
     /// server output, session handle).
     fn session(
         app: Arc<AppState>,
-    ) -> (tokio::io::DuplexStream, tokio::io::Lines<BufReader<tokio::io::DuplexStream>>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::Lines<BufReader<tokio::io::DuplexStream>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (client_w, server_r) = duplex(1 << 16);
         let (server_w, client_r) = duplex(1 << 16);
-        let h = tokio::spawn(run(app, BufReader::new(server_r), server_w, std::future::pending()));
+        let h = tokio::spawn(run(
+            app,
+            BufReader::new(server_r),
+            server_w,
+            std::future::pending(),
+        ));
         (client_w, BufReader::new(client_r).lines(), h)
     }
 
     async fn next(out: &mut tokio::io::Lines<BufReader<tokio::io::DuplexStream>>) -> Value {
-        let l = tokio::time::timeout(Duration::from_secs(5), out.next_line()).await.unwrap().unwrap().unwrap();
+        let l = tokio::time::timeout(Duration::from_secs(5), out.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         serde_json::from_str(&l).expect("every stdout line is one complete JSON message")
     }
 
@@ -373,33 +432,63 @@ mod tests {
         assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
         let r = next(&mut out).await;
         assert_eq!(r["id"], "two");
-        assert!(r["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "execute_command"));
+        assert!(
+            r["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "execute_command")
+        );
         let r = next(&mut out).await;
-        assert_eq!((r["id"].clone(), r["error"]["code"].clone()), (Value::Null, json!(E_PARSE)));
+        assert_eq!(
+            (r["id"].clone(), r["error"]["code"].clone()),
+            (Value::Null, json!(E_PARSE))
+        );
         let r = next(&mut out).await;
-        assert_eq!((r["id"].clone(), r["error"]["code"].clone()), (Value::Null, json!(E_INVALID_REQUEST)));
+        assert_eq!(
+            (r["id"].clone(), r["error"]["code"].clone()),
+            (Value::Null, json!(E_INVALID_REQUEST))
+        );
         let r = next(&mut out).await;
-        assert_eq!((r["id"].clone(), r["result"].clone()), (json!(3), json!({})));
+        assert_eq!(
+            (r["id"].clone(), r["result"].clone()),
+            (json!(3), json!({}))
+        );
         let r = next(&mut out).await;
-        assert_eq!((r["id"].clone(), r["error"]["code"].clone()), (json!(4), json!(-32601)));
+        assert_eq!(
+            (r["id"].clone(), r["error"]["code"].clone()),
+            (json!(4), json!(-32601))
+        );
         let r = next(&mut out).await;
         assert_eq!(r["id"], 5);
         assert_eq!(r["result"]["resultType"], "complete");
         let r = next(&mut out).await;
-        assert_eq!((r["id"].clone(), r["error"]["code"].clone()), (json!(6), json!(-32022)));
+        assert_eq!(
+            (r["id"].clone(), r["error"]["code"].clone()),
+            (json!(6), json!(-32022))
+        );
         let r = next(&mut out).await;
-        assert_eq!((r["id"].clone(), r["error"]["code"].clone()), (json!(7), json!(-32602)));
+        assert_eq!(
+            (r["id"].clone(), r["error"]["code"].clone()),
+            (json!(7), json!(-32602))
+        );
         // tools/call runs on its own task, so its answer may overtake or trail
         // the synchronous batch rejection; ids correlate them.
         let (a, b) = (next(&mut out).await, next(&mut out).await);
         let (call, batch) = if a["id"] == 8 { (a, b) } else { (b, a) };
         assert_eq!(call["id"], 8);
         assert_eq!(call["result"]["content"][0]["text"], "no runs");
-        assert_eq!((batch["id"].clone(), batch["error"]["code"].clone()), (Value::Null, json!(E_INVALID_REQUEST)));
+        assert_eq!(
+            (batch["id"].clone(), batch["error"]["code"].clone()),
+            (Value::Null, json!(E_INVALID_REQUEST))
+        );
 
         writer.await.unwrap();
         // EOF ends the session, and nothing else was written.
-        tokio::time::timeout(Duration::from_secs(10), h).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), h)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(out.next_line().await.unwrap().is_none());
     }
 
@@ -419,15 +508,24 @@ mod tests {
         ];
         // The print macros (their e-prefixed stderr twins are fine), the dbg
         // macro (debug leftovers), and any direct std stdout handle.
-        let banned = regex::Regex::new(concat!(r"(^|[^e])print(ln)?!|\bdbg!|std::io::std", "out")).unwrap();
+        let banned =
+            regex::Regex::new(concat!(r"(^|[^e])print(ln)?!|\bdbg!|std::io::std", "out")).unwrap();
         for (name, src) in srcs {
             if let Some(m) = banned.find(src) {
-                panic!("{name} contains {:?}: stdout is reserved for JSON-RPC in stdio mode", m.as_str());
+                panic!(
+                    "{name} contains {:?}: stdout is reserved for JSON-RPC in stdio mode",
+                    m.as_str()
+                );
             }
         }
-        let n = include_str!("stdio.rs").matches(concat!("tokio::io::std", "out()")).count();
+        let n = include_str!("stdio.rs")
+            .matches(concat!("tokio::io::std", "out()"))
+            .count();
         assert_eq!(n, 1, "only stdio::serve may open stdout");
         let main = include_str!("main.rs");
-        assert!(main.contains(".with_writer(std::io::stderr)"), "logs must go to stderr");
+        assert!(
+            main.contains(".with_writer(std::io::stderr)"),
+            "logs must go to stderr"
+        );
     }
 }

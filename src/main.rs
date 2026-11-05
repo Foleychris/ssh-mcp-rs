@@ -28,7 +28,11 @@ pub struct AppState {
 }
 
 async fn method_not_allowed() -> impl IntoResponse {
-    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")], "")
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, "POST")],
+        "",
+    )
 }
 
 async fn health(State(app): State<Arc<AppState>>) -> impl IntoResponse {
@@ -72,7 +76,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<(Mode, Option<String
     for a in args {
         match a.as_str() {
             "--stdio" => mode = Mode::Stdio,
-            "-h" | "--help" => return Err("sshmux-mcp: MCP server for running commands over SSH".into()),
+            "-h" | "--help" => {
+                return Err("sshmux-mcp: MCP server for running commands over SSH".into());
+            }
             f if f.starts_with('-') => return Err(format!("unknown option {f:?}")),
             _ if path.is_some() => return Err("more than one config path given".into()),
             _ => path = Some(a),
@@ -82,7 +88,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<(Mode, Option<String
 }
 
 fn default_config(mode: Mode) -> String {
-    let xdg = std::env::var("XDG_CONFIG_HOME").ok().filter(|v| !v.is_empty());
+    let xdg = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|v| !v.is_empty());
     let home = std::env::var("HOME").ok().filter(|v| !v.is_empty());
     match (mode, xdg, home) {
         (Mode::Http, _, _) => "/etc/sshmux-mcp/config.toml".into(),
@@ -110,7 +118,9 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
-    let path = path.or_else(|| std::env::var("SSH_MCP_CONFIG").ok()).unwrap_or_else(|| default_config(mode));
+    let path = path
+        .or_else(|| std::env::var("SSH_MCP_CONFIG").ok())
+        .unwrap_or_else(|| default_config(mode));
     let cfg = Arc::new(Config::load(path.as_ref(), mode)?);
     let pool = Arc::new(Pool::new(cfg.clone())?);
     let runs = Runs::new(pool.clone(), cfg.clone());
@@ -147,9 +157,12 @@ async fn main() -> anyhow::Result<()> {
         warn!("listening on non-loopback {addr} WITHOUT an auth token");
     }
     info!(%addr, hosts = cfg.hosts.len(), auth = cfg.auth_token.is_some(), "sshmux-mcp listening on /mcp");
-    axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
@@ -171,7 +184,11 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]));
         let key_file = dir.join("id_ed25519");
-        std::fs::write(&key_file, key.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            &key_file,
+            key.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+        )
+        .unwrap();
         let cfg: Config = toml::from_str(&format!(
             "key_file = {:?}\nlearned_hosts_file = {:?}\n[hosts.box]\naddress = \"192.0.2.1\"\n",
             key_file,
@@ -181,7 +198,12 @@ pub(crate) mod tests {
         let cfg = Arc::new(cfg);
         let pool = Arc::new(Pool::new(cfg.clone()).unwrap());
         let runs = Runs::new(pool.clone(), cfg.clone());
-        Arc::new(AppState { cfg, pool, runs, started: Instant::now() })
+        Arc::new(AppState {
+            cfg,
+            pool,
+            runs,
+            started: Instant::now(),
+        })
     }
 
     fn args(v: &[&str]) -> Result<(Mode, Option<String>), String> {
@@ -193,8 +215,14 @@ pub(crate) mod tests {
         assert_eq!(args(&[]), Ok((Mode::Http, None)));
         assert_eq!(args(&["c.toml"]), Ok((Mode::Http, Some("c.toml".into()))));
         assert_eq!(args(&["--stdio"]), Ok((Mode::Stdio, None)));
-        assert_eq!(args(&["--stdio", "c.toml"]), Ok((Mode::Stdio, Some("c.toml".into()))));
-        assert_eq!(args(&["c.toml", "--stdio"]), Ok((Mode::Stdio, Some("c.toml".into()))));
+        assert_eq!(
+            args(&["--stdio", "c.toml"]),
+            Ok((Mode::Stdio, Some("c.toml".into())))
+        );
+        assert_eq!(
+            args(&["c.toml", "--stdio"]),
+            Ok((Mode::Stdio, Some("c.toml".into())))
+        );
         assert!(args(&["--stdo"]).is_err());
         assert!(args(&["a", "b"]).is_err());
     }
