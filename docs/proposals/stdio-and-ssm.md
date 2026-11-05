@@ -1,7 +1,19 @@
 # Proposal: stdio transport, work-friendly SSH auth, and SSM
 
 Status: **approved for implementation, phases 0–3.** Phase 4 is design only;
-write up findings, don't build it.
+write up findings, don't build it. Phases 0, 1 and 2 are done; phase 3 is next.
+
+Phase 2 as built differs from the text below in these ways:
+- Host keys are looked up under `HostName` (or `HostKeyAlias`), not under the
+  alias the user typed: that is what OpenSSH does. A `HostKeyAlias` is looked
+  up without a port, also as OpenSSH does.
+- `Include` is supported (globs in the last path component, depth 16), because
+  work configs commonly split hosts into `config.d/`.
+- Hosts whose ssh_config sets `ProxyCommand`/`ProxyJump` are refused with an
+  explanation until phase 3, rather than connected to directly.
+- A passphrase-protected `key_file` stops startup only when `key_file` is the
+  sole auth method; with `agent` also listed, the agent is expected to hold it.
+- Offers are capped at 5 per connection (one under sshd's default MaxAuthTries).
 Owner: Chris Foley. Implementer: read `AGENTS.md` first.
 
 ## Why

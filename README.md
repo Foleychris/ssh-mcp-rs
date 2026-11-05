@@ -32,9 +32,11 @@ on Linux. Windows is not supported.
 1. Write `~/.config/sshmux-mcp/config.toml`:
 
    ```toml
-   key_file = "~/.ssh/id_ed25519"
    known_hosts_files = ["~/.ssh/known_hosts"]
    learned_hosts_file = "~/.config/sshmux-mcp/known_hosts.learned"
+   # With no key_file, auth uses ssh-agent ($SSH_AUTH_SOCK). Or set:
+   # key_file = "~/.ssh/id_ed25519"
+   ssh_config = true                    # also use the hosts in ~/.ssh/config
    # default_user defaults to $USER; host_key_policy defaults to "strict"
 
    [hosts.build]
@@ -47,10 +49,10 @@ on Linux. Windows is not supported.
    port = 2222
    ```
 
-   The key must not have a passphrase (ssh-agent support is planned). With the default `strict`
-   policy every host must already be in a known_hosts file: connect once with `ssh`, or set
-   `host_key_policy = "accept-new"` to trust a host's key the first time and refuse it if it
-   ever changes.
+   See [SSH authentication and ~/.ssh/config](#ssh-authentication-and-sshconfig) for keys,
+   agents and certificates. With the default `strict` policy every host must already be in a
+   known_hosts file: connect once with `ssh`, or set `host_key_policy = "accept-new"` to trust a
+   host's key the first time and refuse it if it ever changes.
 
 2. Register it:
 
@@ -108,6 +110,38 @@ such as a claude.ai custom connector, put it behind a TLS-terminating proxy or t
 The repository's `Dockerfile` builds a slim image that runs as UID 1000;
 `compose.example.yaml` shows one way to run it.
 
+## SSH authentication and ~/.ssh/config
+
+`auth` lists the methods to try, in order. The default is `["key_file"]` when `key_file` is set,
+else `["agent"]`.
+
+- **`agent`**: every identity ssh-agent holds (`SSH_AUTH_SOCK`), including OpenSSH
+  certificates. Keys that match the host's `IdentityFile` are offered first.
+- **`key_file`**: the host's `IdentityFile`s from ssh_config, then `key_file`. A file's
+  certificate (`cert_file`, `CertificateFile`, or `<key>-cert.pub`) is tried before the plain
+  key, if it's currently valid and matches the key. A passphrase-protected key can't be used
+  directly: load it into ssh-agent and use `auth = ["agent", "key_file"]`.
+
+At most 5 keys are offered per connection, under sshd's default `MaxAuthTries` of 6. If nothing
+works, the error lists what was tried, by fingerprint. `test_ssh_connection` reports which key
+or certificate succeeded.
+
+With `ssh_config = true` (or a path), host names are also looked up in `~/.ssh/config`, and
+`list_hosts` shows the hosts it names. Explicit `[hosts.*]` entries win; ssh_config fills in
+what they leave unset. Supported: `Host` patterns (`*`, `?`, `!`), `Include`, `HostName`, `User`,
+`Port`, `IdentityFile`, `CertificateFile`, `IdentitiesOnly` and `HostKeyAlias`, with the
+`%d %h %r %u %p %%` tokens and OpenSSH's first-value-wins rule. `Match` blocks are skipped with a
+warning; other directives are ignored. A host named only by a wildcard pattern counts as
+unlisted (see `allow_unlisted_hosts`).
+
+Host keys are checked under the host's `HostName`, or under `HostKeyAlias` when set (looked up
+without a port, as OpenSSH does).
+
+**Proxies aren't supported yet.** A host whose ssh_config sets `ProxyCommand` or `ProxyJump` is
+refused rather than connected to directly, since that could bypass a bastion. Support (which
+covers AWS SSM, bastions and `cloudflared access ssh`) is planned; see
+`docs/proposals/stdio-and-ssm.md`.
+
 ## Tools
 
 | Tool | What it does |
@@ -130,7 +164,10 @@ TOML; unknown keys are rejected. CONFIG defaults to `$SSH_MCP_CONFIG`, then
 
 | Key | Default | |
 |---|---|---|
-| `key_file` | required | Private key (no passphrase). |
+| `auth` | `["key_file"]` if `key_file` is set, else `["agent"]` | Auth methods in order: `"agent"`, `"key_file"`. |
+| `key_file` | none | Private key (no passphrase; use the agent for those). |
+| `cert_file` | `<key_file>-cert.pub` if present | OpenSSH certificate for `key_file`. |
+| `ssh_config` | off | `true` for `~/.ssh/config`, or a path. |
 | `learned_hosts_file` | required | Where `accept-new` records keys; read if present. |
 | `known_hosts_files` | `[]` | Read-only known_hosts files to trust. Each must exist. |
 | `host_key_policy` | `"strict"` | Or `"accept-new"`: learn unknown hosts, refuse changed keys. |
@@ -170,8 +207,9 @@ if the key's user has passwordless sudo. Treat access to it like access to the k
   channel. Use `nohup` or `systemd-run` for jobs that must outlive it.
 - sshd `MaxSessions` (default 10) caps channels per connection; `channels_per_conn = 6` leaves
   headroom. A refused channel is retried with backoff.
-- Key file auth only, for now. ssh-agent, OpenSSH certificates, `~/.ssh/config` and
-  ProxyCommand/SSM are planned (`docs/proposals/stdio-and-ssm.md`).
+- No `ProxyCommand` / `ProxyJump` (so no AWS SSM or bastions) yet: such hosts are refused.
+  Planned in `docs/proposals/stdio-and-ssm.md`.
+- No password or keyboard-interactive auth, and no ssh_config `Match` blocks.
 
 ## Development
 
@@ -180,6 +218,8 @@ cargo test --release     # unit tests
 cargo clippy --release --all-targets -- -D warnings
 ```
 
+`tests/auth.rs` starts its own throwaway sshd and ssh-agent (needs OpenSSH installed):
+`cargo test --release --test auth -- --ignored --test-threads=1`.
 `tests/stdio.rs` is an integration test against a real host (never production):
 `SSH_MCP_TEST_CONFIG=… SSH_MCP_TEST_HOST=… cargo test --release --test stdio -- --ignored --test-threads=1`.
 Contributor notes are in `AGENTS.md`.
