@@ -45,7 +45,7 @@ fn json_resp(status: StatusCode, body: Value) -> Response {
 }
 
 fn server_info() -> Value {
-    json!({"name": "ssh-mcp-rs", "title": "SSH", "version": env!("CARGO_PKG_VERSION")})
+    json!({"name": "sshmux-mcp", "title": "SSH", "version": env!("CARGO_PKG_VERSION")})
 }
 
 fn instructions(app: &AppState) -> String {
@@ -487,7 +487,7 @@ mod tests {
         let r = call(req(json!(1), "initialize", json!({"protocolVersion": "2025-06-18"}))).await.unwrap();
         assert_eq!(r["id"], 1);
         assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(r["result"]["serverInfo"]["name"], "ssh-mcp-rs");
+        assert_eq!(r["result"]["serverInfo"]["name"], "sshmux-mcp");
         assert!(r["result"]["instructions"].as_str().unwrap().contains("box"));
         // An unknown version negotiates down to the newest legacy one.
         let r = call(req(json!(1), "initialize", json!({"protocolVersion": "1.0"}))).await.unwrap();
@@ -523,7 +523,7 @@ mod tests {
         let r = call(modern_req(1, "server/discover", json!({}))).await.unwrap();
         assert_eq!(r["result"]["supportedVersions"], json!([MODERN]));
         assert_eq!(r["result"]["ttlMs"], 300_000);
-        assert_eq!(r["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "ssh-mcp-rs");
+        assert_eq!(r["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "sshmux-mcp");
 
         let r = call(modern_req(2, "tools/list", json!({}))).await.unwrap();
         assert_eq!(r["result"]["resultType"], "complete");

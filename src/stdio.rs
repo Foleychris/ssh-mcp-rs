@@ -43,7 +43,7 @@ fn rpc_err(id: &Value, code: i64, msg: impl Into<String>) -> Value {
 pub async fn serve(app: Arc<AppState>) -> anyhow::Result<()> {
     let ppid = std::os::unix::process::parent_id();
     info!(hosts = app.cfg.hosts.len(), ppid,
-          "ssh-mcp-rs serving MCP on stdio: no network listener and no network-facing auth \
+          "sshmux-mcp serving MCP on stdio: no network listener and no network-facing auth \
            (listen, auth_token and allowed_origins are ignored); the parent process is the client");
     info!(target: "audit", client = "stdio", ppid, "stdio session started");
     let input = BufReader::new(tokio::io::stdin());

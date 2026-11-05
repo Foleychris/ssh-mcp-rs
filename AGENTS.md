@@ -37,7 +37,7 @@ cargo clippy --release        # don't add new warnings in code you touch
 Run a dev server on a spare loopback port with your own config:
 
 ```
-SSH_MCP_LISTEN=127.0.0.1:8013 ./target/release/ssh-mcp-rs /path/to/config.toml
+SSH_MCP_LISTEN=127.0.0.1:8013 ./target/release/sshmux-mcp /path/to/config.toml
 curl -s 127.0.0.1:8013/healthz
 ```
 

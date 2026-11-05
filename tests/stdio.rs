@@ -1,4 +1,4 @@
-//! Integration test for `ssh-mcp-rs --stdio` against a real SSH host.
+//! Integration test for `sshmux-mcp --stdio` against a real SSH host.
 //!
 //! Ignored by default: it needs a config and a reachable host. Never point it
 //! at a production host; it starts and kills `sleep` processes there.
@@ -42,7 +42,7 @@ fn config(on_exit: Option<&str>) -> String {
 
 impl Server {
     fn start(cfg: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ssh-mcp-rs"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sshmux-mcp"))
             .args(["--stdio", cfg])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -1,8 +1,15 @@
 [package]
-name = "ssh-mcp-rs"
+name = "sshmux-mcp"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 license = "MIT"
+description = "MCP server that runs commands and edits files on remote hosts over pooled, multiplexed SSH (stdio or Streamable HTTP)"
+repository = "https://github.com/foleychris/ssh-mcp-rs"
+readme = "README.md"
+keywords = ["mcp", "ssh", "llm", "agent", "claude"]
+categories = ["command-line-utilities", "network-programming"]
+include = ["/src", "/tests/stdio.rs", "/README.md", "/LICENSE"]
 
 [dependencies]
 anyhow = "1.0.104"

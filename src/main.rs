@@ -58,11 +58,11 @@ pub(crate) async fn shutdown_signal() {
     info!("shutting down");
 }
 
-const USAGE: &str = "usage: ssh-mcp-rs [--stdio] [CONFIG]\n\n\
+const USAGE: &str = "usage: sshmux-mcp [--stdio] [CONFIG]\n\n\
   (default)  serve MCP over Streamable HTTP on `listen` (POST /mcp)\n\
   --stdio    serve MCP over stdin/stdout for a local client; no network listener\n\n\
-CONFIG defaults to $SSH_MCP_CONFIG, then /etc/ssh-mcp-rs/config.toml (HTTP) or\n\
-$XDG_CONFIG_HOME/ssh-mcp-rs/config.toml, ~/.config/ssh-mcp-rs/config.toml (stdio).";
+CONFIG defaults to $SSH_MCP_CONFIG, then /etc/sshmux-mcp/config.toml (HTTP) or\n\
+$XDG_CONFIG_HOME/sshmux-mcp/config.toml, ~/.config/sshmux-mcp/config.toml (stdio).";
 
 /// `[--stdio] [CONFIG]`, in any order. Unknown flags are an error rather than
 /// being taken for a config path.
@@ -72,7 +72,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<(Mode, Option<String
     for a in args {
         match a.as_str() {
             "--stdio" => mode = Mode::Stdio,
-            "-h" | "--help" => return Err("ssh-mcp-rs: MCP server for running commands over SSH".into()),
+            "-h" | "--help" => return Err("sshmux-mcp: MCP server for running commands over SSH".into()),
             f if f.starts_with('-') => return Err(format!("unknown option {f:?}")),
             _ if path.is_some() => return Err("more than one config path given".into()),
             _ => path = Some(a),
@@ -85,10 +85,10 @@ fn default_config(mode: Mode) -> String {
     let xdg = std::env::var("XDG_CONFIG_HOME").ok().filter(|v| !v.is_empty());
     let home = std::env::var("HOME").ok().filter(|v| !v.is_empty());
     match (mode, xdg, home) {
-        (Mode::Http, _, _) => "/etc/ssh-mcp-rs/config.toml".into(),
-        (Mode::Stdio, Some(x), _) => format!("{x}/ssh-mcp-rs/config.toml"),
-        (Mode::Stdio, None, Some(h)) => format!("{h}/.config/ssh-mcp-rs/config.toml"),
-        (Mode::Stdio, None, None) => "/etc/ssh-mcp-rs/config.toml".into(),
+        (Mode::Http, _, _) => "/etc/sshmux-mcp/config.toml".into(),
+        (Mode::Stdio, Some(x), _) => format!("{x}/sshmux-mcp/config.toml"),
+        (Mode::Stdio, None, Some(h)) => format!("{h}/.config/sshmux-mcp/config.toml"),
+        (Mode::Stdio, None, None) => "/etc/sshmux-mcp/config.toml".into(),
     }
 }
 
@@ -146,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
     if !addr.ip().is_loopback() && cfg.auth_token.is_none() {
         warn!("listening on non-loopback {addr} WITHOUT an auth token");
     }
-    info!(%addr, hosts = cfg.hosts.len(), auth = cfg.auth_token.is_some(), "ssh-mcp-rs listening on /mcp");
+    info!(%addr, hosts = cfg.hosts.len(), auth = cfg.auth_token.is_some(), "sshmux-mcp listening on /mcp");
     axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -164,7 +164,7 @@ pub(crate) mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ssh-mcp-rs-test-{}-{}",
+            "sshmux-mcp-test-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));

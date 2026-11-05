@@ -53,19 +53,19 @@ ordinary tools (run_id handle pattern), which works with every client today.
 
 ## Running locally (stdio)
 
-`ssh-mcp-rs --stdio [CONFIG]` serves MCP over stdin/stdout (newline-delimited JSON-RPC) for a
+`sshmux-mcp --stdio [CONFIG]` serves MCP over stdin/stdout (newline-delimited JSON-RPC) for a
 local client such as Claude Code. There is no network listener and no auth: the process that
 spawns it is the client. `listen`, `auth_token`, `SSH_MCP_TOKEN*`, `allowed_origins` and
 `allow_query_token` are ignored; every other key means the same as over HTTP, so an HTTP config
-works unchanged. CONFIG defaults to `$SSH_MCP_CONFIG`, then `$XDG_CONFIG_HOME/ssh-mcp-rs/config.toml`,
-then `~/.config/ssh-mcp-rs/config.toml`.
+works unchanged. CONFIG defaults to `$SSH_MCP_CONFIG`, then `$XDG_CONFIG_HOME/sshmux-mcp/config.toml`,
+then `~/.config/sshmux-mcp/config.toml`.
 
 ```toml
-# ~/.config/ssh-mcp-rs/config.toml
+# ~/.config/sshmux-mcp/config.toml
 default_user = "ubuntu"
 key_file = "/home/me/.ssh/id_ed25519"
 known_hosts_files = ["/home/me/.ssh/known_hosts"]
-learned_hosts_file = "/home/me/.config/ssh-mcp-rs/known_hosts.learned"
+learned_hosts_file = "/home/me/.config/sshmux-mcp/known_hosts.learned"
 host_key_policy = "strict"          # or "accept-new" (trust on first use)
 stdio_on_exit = "cancel"            # default; "leave" keeps runs going when the client exits
 
@@ -77,8 +77,8 @@ description = "build box"
 Register it with Claude Code:
 
 ```
-claude mcp add ssh -- /path/to/ssh-mcp-rs --stdio
-claude mcp add --scope user ssh -- /path/to/ssh-mcp-rs --stdio /path/to/config.toml
+claude mcp add ssh -- /path/to/sshmux-mcp --stdio
+claude mcp add --scope user ssh -- /path/to/sshmux-mcp --stdio /path/to/config.toml
 ```
 
 Behaviour over stdio:
