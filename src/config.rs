@@ -26,6 +26,25 @@ pub enum OnExit {
     Leave,
 }
 
+/// A way to authenticate to SSH servers, tried in the order listed in `auth`.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethod {
+    /// Identities held by ssh-agent (`SSH_AUTH_SOCK`), including certificates.
+    Agent,
+    /// `key_file` (or a host's `IdentityFile` from ssh_config), with its
+    /// OpenSSH certificate when one exists.
+    KeyFile,
+}
+
+/// `ssh_config = true` reads `~/.ssh/config`; a string names another file.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SshConfigSetting {
+    Enabled(bool),
+    Path(PathBuf),
+}
+
 /// Which transport the server runs. Selects which startup checks apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -129,7 +148,19 @@ pub struct Config {
     pub default_user: String,
     #[serde(default = "d_port")]
     pub default_port: u16,
-    pub key_file: PathBuf,
+    /// Private key (no passphrase). Optional when ssh-agent is used.
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+    /// OpenSSH certificate for `key_file`. Default: `<key_file>-cert.pub` if it exists.
+    #[serde(default)]
+    pub cert_file: Option<PathBuf>,
+    /// Auth methods in order. Default `["key_file"]` if `key_file` is set, else `["agent"]`.
+    #[serde(default)]
+    pub auth: Option<Vec<AuthMethod>>,
+    /// Read host aliases, users, ports, identity files and HostKeyAlias from
+    /// an OpenSSH config file. Off by default.
+    #[serde(default)]
+    pub ssh_config: Option<SshConfigSetting>,
     /// Read-only known_hosts files to trust (e.g. ~/.ssh/known_hosts).
     #[serde(default)]
     pub known_hosts_files: Vec<PathBuf>,
@@ -198,7 +229,26 @@ impl Config {
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         let home = std::env::var("HOME").ok();
         let ex = |p: &Path| expand_tilde(p, home.as_deref());
-        cfg.key_file = ex(&cfg.key_file);
+        cfg.key_file = cfg.key_file.as_deref().map(ex);
+        cfg.cert_file = cfg.cert_file.as_deref().map(ex);
+        if let Some(SshConfigSetting::Path(p)) = &cfg.ssh_config {
+            cfg.ssh_config = Some(SshConfigSetting::Path(ex(p)));
+        }
+        let methods = cfg.auth_methods();
+        if methods.is_empty() {
+            bail!("auth is empty; list at least one of \"agent\", \"key_file\"");
+        }
+        if methods.contains(&AuthMethod::KeyFile)
+            && cfg.key_file.is_none()
+            && cfg.ssh_config_path(home.as_deref()).is_none()
+        {
+            bail!(
+                "auth includes \"key_file\" but key_file is not set (and ssh_config, which could supply IdentityFile, is off)"
+            );
+        }
+        if cfg.cert_file.is_some() && cfg.key_file.is_none() {
+            bail!("cert_file is set but key_file is not; a certificate needs its private key");
+        }
         cfg.learned_hosts_file = ex(&cfg.learned_hosts_file);
         cfg.known_hosts_files = cfg.known_hosts_files.iter().map(|p| ex(p)).collect();
         if cfg.default_user.trim().is_empty() {
@@ -245,6 +295,24 @@ impl Config {
             }
         }
         Ok(cfg)
+    }
+
+    /// Auth methods in the order they are tried.
+    pub fn auth_methods(&self) -> Vec<AuthMethod> {
+        match &self.auth {
+            Some(m) => m.clone(),
+            None if self.key_file.is_some() => vec![AuthMethod::KeyFile],
+            None => vec![AuthMethod::Agent],
+        }
+    }
+
+    /// The ssh_config file to read, if enabled.
+    pub fn ssh_config_path(&self, home: Option<&str>) -> Option<PathBuf> {
+        match &self.ssh_config {
+            Some(SshConfigSetting::Path(p)) => Some(p.clone()),
+            Some(SshConfigSetting::Enabled(true)) => home.map(|h| Path::new(h).join(".ssh/config")),
+            _ => None,
+        }
     }
 
     /// HTTP-mode token handling and startup refusals (env overrides, minimum
@@ -316,6 +384,64 @@ mod tests {
             expand_tilde(Path::new("~/x"), Some("")),
             PathBuf::from("~/x")
         );
+    }
+
+    #[test]
+    fn auth_method_defaults_and_parsing() {
+        let parse = |t: &str| {
+            toml::from_str::<Config>(&format!("learned_hosts_file = \"l\"\n{t}")).unwrap()
+        };
+        assert_eq!(
+            parse("key_file = \"k\"").auth_methods(),
+            vec![AuthMethod::KeyFile]
+        );
+        assert_eq!(parse("").auth_methods(), vec![AuthMethod::Agent]);
+        assert_eq!(
+            parse("key_file = \"k\"\nauth = [\"agent\", \"key_file\"]").auth_methods(),
+            vec![AuthMethod::Agent, AuthMethod::KeyFile]
+        );
+        assert!(
+            toml::from_str::<Config>("learned_hosts_file = \"l\"\nauth = [\"password\"]").is_err()
+        );
+        let c = parse("ssh_config = true");
+        assert_eq!(
+            c.ssh_config_path(Some("/h")),
+            Some(PathBuf::from("/h/.ssh/config"))
+        );
+        assert_eq!(
+            parse("ssh_config = false").ssh_config_path(Some("/h")),
+            None
+        );
+        assert_eq!(
+            parse("ssh_config = \"/etc/x\"").ssh_config_path(None),
+            Some(PathBuf::from("/etc/x"))
+        );
+        assert_eq!(parse("").ssh_config_path(Some("/h")), None);
+    }
+
+    fn load_str(text: &str) -> Result<Config> {
+        let dir =
+            std::env::temp_dir().join(format!("cfg-test-{}-{}", std::process::id(), text.len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.toml");
+        std::fs::write(
+            &p,
+            format!("default_user = \"u\"\nlearned_hosts_file = \"l\"\n{text}"),
+        )
+        .unwrap();
+        let r = Config::load(&p, Mode::Stdio);
+        std::fs::remove_dir_all(&dir).unwrap();
+        r
+    }
+
+    #[test]
+    fn auth_validation() {
+        assert!(load_str("").is_ok(), "agent-only needs no key_file");
+        assert!(load_str("auth = []").is_err());
+        assert!(load_str("auth = [\"key_file\"]").is_err());
+        assert!(load_str("auth = [\"key_file\"]\nssh_config = \"/x\"").is_ok());
+        assert!(load_str("cert_file = \"c\"").is_err());
+        assert!(load_str("key_file = \"k\"\ncert_file = \"c\"").is_ok());
     }
 
     #[test]

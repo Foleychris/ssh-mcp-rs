@@ -3,6 +3,8 @@ mod fileops;
 mod mcp;
 mod runs;
 mod ssh;
+mod sshauth;
+mod sshconfig;
 mod stdio;
 mod tools;
 

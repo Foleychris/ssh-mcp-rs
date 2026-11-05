@@ -716,7 +716,7 @@ async fn test_conn(app: &Arc<AppState>, args: Value) -> ToolOut {
     {
         Ok((Some(0), out, _)) => {
             let mut l = out.lines().skip(1);
-            ok(format!(
+            let mut t = format!(
                 "✅ {} reachable — logged in as {} on {} ({}:{}), round trip {:.0} ms",
                 target.alias,
                 l.next().unwrap_or("?"),
@@ -724,7 +724,11 @@ async fn test_conn(app: &Arc<AppState>, args: Value) -> ToolOut {
                 target.address,
                 target.port,
                 t0.elapsed().as_secs_f64() * 1000.0
-            ))
+            );
+            if let Some(a) = app.pool.auth_used(&target) {
+                let _ = write!(t, "\nauthenticated with {a}");
+            }
+            ok(t)
         }
         Ok((code, out, e)) => err(format!(
             "connected but test command failed ({code:?}): {out}{e}"
@@ -747,6 +751,24 @@ fn list_hosts(app: &Arc<AppState>) -> ToolOut {
                 .map(|d| format!("  — {d}"))
                 .unwrap_or_default()
         );
+    }
+    let extra = app.pool.ssh_config_hosts();
+    if !extra.is_empty() {
+        t.push_str("\nFrom ssh_config (resolved on use):\n");
+        for name in extra {
+            let line = match app.pool.resolve(&name, None) {
+                Ok(tg) => {
+                    let via = tg
+                        .proxy
+                        .as_ref()
+                        .map(|(k, v)| format!("  — via {k} {v} (not supported yet)"))
+                        .unwrap_or_default();
+                    format!("  {name:<10} {}@{}:{}{via}", tg.user, tg.address, tg.port)
+                }
+                Err(e) => format!("  {name:<10} (error: {e:#})"),
+            };
+            let _ = writeln!(t, "{line}");
+        }
     }
     let stats = app.pool.stats();
     if !stats.is_empty() {

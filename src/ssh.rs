@@ -4,10 +4,12 @@
 //! concurrent exec channels; more connections are opened on demand up to
 //! `max_conns_per_host`. Callers beyond that queue on a per-host semaphore.
 
-use crate::config::{Config, HostKeyPolicy};
+use crate::config::{AuthMethod, Config, HostKeyPolicy};
+use crate::sshauth::{KeyCache, KeyFile};
+use crate::sshconfig::{Resolved, SshConfig, Tokens};
 use anyhow::{Context, Result, anyhow, bail};
 use russh::keys::known_hosts::learn_known_hosts_path;
-use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
+use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::{ChannelMsg, client};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,17 +19,49 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
-#[derive(Clone, Debug)]
+/// sshd's default `MaxAuthTries` is 6; stay under it so a server that has
+/// already refused several keys doesn't disconnect us before the last one.
+pub const MAX_AUTH_ATTEMPTS: usize = 5;
+
+#[derive(Clone, Debug, Default)]
 pub struct Target {
     pub alias: String,
     pub address: String,
     pub port: u16,
     pub user: String,
+    /// Name to look host keys up under (ssh_config `HostKeyAlias`); else `address`.
+    pub host_key_alias: Option<String>,
+    /// Per-host identity files (ssh_config `IdentityFile`), tried before `key_file`.
+    pub identity_files: Vec<PathBuf>,
+    /// Per-host certificates (ssh_config `CertificateFile`).
+    pub cert_files: Vec<PathBuf>,
+    /// ssh_config `IdentitiesOnly`: offer only agent keys matching the identity files.
+    pub identities_only: bool,
+    /// ssh_config `ProxyCommand` / `ProxyJump` (not supported yet: refused).
+    pub proxy: Option<(String, String)>,
 }
 
 impl Target {
     pub fn key(&self) -> String {
-        format!("{}@{}:{}", self.user, self.address, self.port)
+        match &self.host_key_alias {
+            Some(a) => format!("{}@{}:{}#{a}", self.user, self.address, self.port),
+            None => format!("{}@{}:{}", self.user, self.address, self.port),
+        }
+    }
+
+    /// The name host keys are checked (and learned) under.
+    pub fn host_key_name(&self) -> &str {
+        self.host_key_alias.as_deref().unwrap_or(&self.address)
+    }
+
+    /// The port host keys are recorded with. As in OpenSSH, a `HostKeyAlias`
+    /// is looked up bare (no `[name]:port` form), whatever the real port.
+    pub fn host_key_port(&self) -> u16 {
+        if self.host_key_alias.is_some() {
+            22
+        } else {
+            self.port
+        }
     }
 }
 
@@ -162,12 +196,35 @@ impl client::Handler for Handler {
 
 // ---------------------------------------------------------------- pool
 
+/// Hostnames and usernames come from the caller and can end up in ssh_config
+/// `%h`/`%r` tokens (e.g. an `IdentityFile` path) and in error messages, so
+/// refuse anything that could act as a path, a token or an option.
+fn check_name(what: &str, v: &str) -> Result<()> {
+    if v.starts_with('-')
+        || v.chars()
+            .any(|c| c == '/' || c == '%' || c.is_control() || c.is_whitespace())
+    {
+        bail!(
+            "invalid {what} {v:?}: it may not start with '-' or contain '/', '%', spaces or control characters"
+        );
+    }
+    Ok(())
+}
+
+/// Certificates configured for the global key_file: `cert_file` if set
+/// (`<key_file>-cert.pub` is always looked for too).
+fn global_certs(cfg: &Config) -> Vec<PathBuf> {
+    cfg.cert_file.iter().cloned().collect()
+}
+
 pub struct Conn {
     pub id: u64,
     handle: client::Handle<Handler>,
     chans: Arc<Semaphore>,
     dead: AtomicBool,
     pub created: Instant,
+    /// How this connection authenticated (fingerprints, no key material).
+    pub auth: String,
 }
 
 impl Conn {
@@ -190,7 +247,10 @@ pub struct Lease {
 
 pub struct Pool {
     cfg: Arc<Config>,
-    key: Arc<PrivateKey>,
+    keys: KeyCache,
+    ssh_config: Option<SshConfig>,
+    home: String,
+    local_user: String,
     kc: Arc<KeyCheck>,
     ssh_cfg: Arc<client::Config>,
     hosts: std::sync::Mutex<HashMap<String, Arc<HostPool>>>,
@@ -205,8 +265,42 @@ pub struct HostStat {
 
 impl Pool {
     pub fn new(cfg: Arc<Config>) -> Result<Self> {
-        let key = russh::keys::load_secret_key(&cfg.key_file, None)
-            .with_context(|| format!("loading private key {}", cfg.key_file.display()))?;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let local_user = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_default();
+        let keys = KeyCache::default();
+        let methods = cfg.auth_methods();
+        // Fail fast on a configured key_file that can't be used directly,
+        // unless the agent (which may hold it) is also an auth method.
+        if methods.contains(&AuthMethod::KeyFile)
+            && let Some(k) = &cfg.key_file
+            && let KeyFile::Unusable { reason, .. } = keys.get(k, &global_certs(&cfg))
+        {
+            if methods.contains(&AuthMethod::Agent) {
+                warn!(
+                    "key_file {}: {reason}; relying on ssh-agent for it",
+                    k.display()
+                );
+            } else {
+                bail!("key_file {}: {reason}", k.display());
+            }
+        }
+        if methods.contains(&AuthMethod::Agent) && std::env::var_os("SSH_AUTH_SOCK").is_none() {
+            warn!(
+                "auth includes \"agent\" but SSH_AUTH_SOCK is not set; agent auth will be skipped"
+            );
+        }
+        let ssh_config =
+            match cfg.ssh_config_path(Some(&home).filter(|h| !h.is_empty()).map(String::as_str)) {
+                Some(p) => {
+                    let c = SshConfig::load(&p, &home)?;
+                    info!(file = %p.display(), hosts = c.named_hosts().len(), "loaded ssh config");
+                    Some(c)
+                }
+                None => None,
+            };
+        info!(auth = ?methods, "ssh client auth");
         let ssh_cfg = client::Config {
             inactivity_timeout: None,
             keepalive_interval: Some(Duration::from_secs(cfg.limits.keepalive_secs.max(5))),
@@ -219,7 +313,10 @@ impl Pool {
                 learned: cfg.learned_hosts_file.clone(),
                 policy: cfg.host_key_policy,
             }),
-            key: Arc::new(key),
+            keys,
+            ssh_config,
+            home,
+            local_user,
             ssh_cfg: Arc::new(ssh_cfg),
             cfg,
             hosts: Default::default(),
@@ -228,6 +325,8 @@ impl Pool {
     }
 
     /// Map a user-supplied hostname (alias, address, or anything) to a target.
+    /// Explicit `[hosts.*]` entries win; ssh_config (if enabled) fills in what
+    /// they leave unset, and describes hosts that aren't listed.
     pub fn resolve(&self, hostname: &str, username: Option<&str>) -> Result<Target> {
         let h = hostname.trim();
         if h.is_empty() {
@@ -239,38 +338,113 @@ impl Pool {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(h))
             .or_else(|| self.cfg.hosts.iter().find(|(_, v)| v.address == h));
-        let user_override = username.map(str::trim).filter(|u| !u.is_empty());
-        match found {
-            Some((alias, hc)) => Ok(Target {
-                alias: alias.clone(),
-                address: hc.address.clone(),
-                port: hc.port.unwrap_or(self.cfg.default_port),
-                user: user_override
-                    .map(String::from)
-                    .or_else(|| hc.user.clone())
-                    .unwrap_or_else(|| self.cfg.default_user.clone()),
-            }),
-            None if self.cfg.allow_unlisted_hosts => {
-                let (addr, port) = match h.rsplit_once(':') {
-                    Some((a, p)) if !a.contains(':') && p.parse::<u16>().is_ok() => {
-                        (a.to_string(), p.parse().unwrap())
-                    }
-                    _ => (h.to_string(), self.cfg.default_port),
-                };
-                Ok(Target {
-                    alias: h.to_string(),
-                    address: addr,
-                    port,
-                    user: user_override
-                        .map(String::from)
-                        .unwrap_or_else(|| self.cfg.default_user.clone()),
-                })
+        check_name("hostname", h)?;
+        let user_override = username
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(String::from);
+        if let Some(u) = &user_override {
+            check_name("username", u)?;
+        }
+        let sc = |name: &str| -> Result<Resolved> {
+            match &self.ssh_config {
+                Some(c) => c
+                    .resolve(
+                        name,
+                        &Tokens {
+                            home: &self.home,
+                            local_user: &self.local_user,
+                        },
+                    )
+                    .with_context(|| format!("in {}", c.source.display())),
+                None => Ok(Resolved::default()),
+            }
+        };
+        let (alias, address, port, user, r) = match found {
+            Some((alias, hc)) => {
+                let r = sc(alias)?;
+                (
+                    alias.clone(),
+                    hc.address.clone(),
+                    hc.port.or(r.port),
+                    hc.user.clone().or(r.user.clone()),
+                    r,
+                )
             }
             None => {
-                let known: Vec<&str> = self.cfg.hosts.keys().map(String::as_str).collect();
-                bail!("unknown host '{h}'. Configured hosts: {}", known.join(", "))
+                let (name, explicit_port) = match h.rsplit_once(':') {
+                    Some((a, p)) if !a.contains(':') && p.parse::<u16>().is_ok() => {
+                        (a, p.parse().ok())
+                    }
+                    _ => (h, None),
+                };
+                let r = sc(name)?;
+                if !self.cfg.allow_unlisted_hosts && !r.named {
+                    let mut known: Vec<String> = self.cfg.hosts.keys().cloned().collect();
+                    if let Some(c) = &self.ssh_config {
+                        known.extend(c.named_hosts());
+                    }
+                    bail!("unknown host '{h}'. Configured hosts: {}", known.join(", "));
+                }
+                let address = r.hostname.clone().unwrap_or_else(|| name.to_string());
+                (
+                    h.to_string(),
+                    address,
+                    explicit_port.or(r.port),
+                    r.user.clone(),
+                    r,
+                )
             }
+        };
+        let mut t = Target {
+            alias,
+            address,
+            port: port.unwrap_or(self.cfg.default_port),
+            user: user_override
+                .or(user)
+                .unwrap_or_else(|| self.cfg.default_user.clone()),
+            host_key_alias: r.host_key_alias,
+            identity_files: r.identity_files,
+            cert_files: r.certificate_files,
+            identities_only: r.identities_only,
+            proxy: r.proxy,
+        };
+        // As in OpenSSH, identity files are skipped silently when neither the
+        // key nor its `.pub` exists (the `.pub` alone still selects agent keys).
+        t.identity_files.retain(|p| {
+            let mut pubp = p.as_os_str().to_owned();
+            pubp.push(".pub");
+            p.exists() || std::path::Path::new(&pubp).exists()
+        });
+        Ok(t)
+    }
+
+    /// Hosts named in ssh_config (for list_hosts), excluding ones also in `[hosts]`.
+    pub fn ssh_config_hosts(&self) -> Vec<String> {
+        let Some(c) = &self.ssh_config else {
+            return vec![];
+        };
+        c.named_hosts()
+            .into_iter()
+            .filter(|n| !self.cfg.hosts.keys().any(|k| k.eq_ignore_ascii_case(n)))
+            .collect()
+    }
+
+    /// Key files to try for `t`, each with the certificates that may belong to it.
+    fn key_files(&self, t: &Target) -> Vec<(PathBuf, Vec<PathBuf>)> {
+        let mut v: Vec<(PathBuf, Vec<PathBuf>)> = t
+            .identity_files
+            .iter()
+            .map(|p| (p.clone(), t.cert_files.clone()))
+            .collect();
+        if let Some(k) = &self.cfg.key_file
+            && !v.iter().any(|(p, _)| p == k)
+        {
+            let mut c = t.cert_files.clone();
+            c.extend(global_certs(&self.cfg));
+            v.push((k.clone(), c));
         }
+        v
     }
 
     /// `control` pools are separate so kill/info helpers never queue behind
@@ -294,9 +468,17 @@ impl Pool {
     }
 
     async fn connect(&self, t: &Target) -> Result<Arc<Conn>> {
+        if let Some((kind, value)) = &t.proxy {
+            bail!(
+                "{} is configured with {kind} {value:?} in ssh_config, and proxies aren't supported yet. \
+                 Nothing was attempted: connecting directly instead could bypass the proxy. Add a [hosts] \
+                 entry with a directly reachable address, or `{kind} none` for this host, to connect directly.",
+                t.alias
+            );
+        }
         let handler = Handler {
-            host: t.address.clone(),
-            port: t.port,
+            host: t.host_key_name().to_string(),
+            port: t.host_key_port(),
             kc: self.kc.clone(),
         };
         let timeout = Duration::from_secs(self.cfg.limits.connect_timeout_secs);
@@ -305,33 +487,29 @@ impl Pool {
                 client::connect(self.ssh_cfg.clone(), (t.address.as_str(), t.port), handler)
                     .await
                     .map_err(|e| anyhow!("connect {}:{}: {e}", t.address, t.port))?;
-            let hash = handle.best_supported_rsa_hash().await?.flatten();
-            let auth = handle
-                .authenticate_publickey(
-                    t.user.clone(),
-                    PrivateKeyWithHashAlg::new(self.key.clone(), hash),
-                )
-                .await?;
-            if !auth.success() {
-                bail!(
-                    "public-key authentication failed for {}@{} (is the key in authorized_keys?)",
-                    t.user,
-                    t.alias
-                );
-            }
-            Ok::<_, anyhow::Error>(handle)
+            let how = crate::sshauth::authenticate(
+                &mut handle,
+                t,
+                &self.cfg.auth_methods(),
+                &self.key_files(t),
+                &self.keys,
+            )
+            .await
+            .map_err(|e| anyhow!(e))?;
+            Ok::<_, anyhow::Error>((handle, how))
         };
-        let handle = tokio::time::timeout(timeout, fut)
+        let (handle, how) = tokio::time::timeout(timeout, fut)
             .await
             .map_err(|_| anyhow!("timed out connecting to {} after {timeout:?}", t.alias))??;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        info!(conn = id, target = %t.key(), "ssh connection established");
+        info!(conn = id, target = %t.key(), auth = %how, "ssh connection established");
         Ok(Arc::new(Conn {
             id,
             handle,
             chans: Arc::new(Semaphore::new(self.cfg.limits.channels_per_conn)),
             dead: AtomicBool::new(false),
             created: Instant::now(),
+            auth: how,
         }))
     }
 
@@ -436,6 +614,17 @@ impl Pool {
             .map_err(|_| anyhow!("timed out after {timeout:?}"))?
     }
 
+    /// How the pooled connection(s) to `t` authenticated, if any are open.
+    pub fn auth_used(&self, t: &Target) -> Option<String> {
+        let hp = self.hosts.lock().unwrap().get(&t.key()).cloned()?;
+        let conns = hp.conns.try_lock().ok()?;
+        conns
+            .iter()
+            .rev()
+            .find(|c| c.usable())
+            .map(|c| c.auth.clone())
+    }
+
     pub fn stats(&self) -> Vec<HostStat> {
         let pools: Vec<(String, Arc<HostPool>)> = self
             .hosts
@@ -458,5 +647,35 @@ impl Pool {
                 in_use: total - hp.permits.available_permits(),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caller_names_are_checked() {
+        for ok in [
+            "build",
+            "10.0.0.5",
+            "web-01.example.com",
+            "fe80::1",
+            "DOMAIN\\user",
+            "user@realm",
+        ] {
+            assert!(check_name("x", ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "../../etc/x",
+            "a/b",
+            "%d",
+            "-oProxyCommand=x",
+            "a b",
+            "a\nb",
+            "a\0b",
+        ] {
+            assert!(check_name("x", bad).is_err(), "{bad:?}");
+        }
     }
 }
