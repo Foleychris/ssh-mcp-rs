@@ -1,7 +1,22 @@
 # Proposal: stdio transport, work-friendly SSH auth, and SSM
 
 Status: **approved for implementation, phases 0–3.** Phase 4 is design only;
-write up findings, don't build it. Phases 0, 1 and 2 are done; phase 3 is next.
+write up findings, don't build it. Phases 0–3 are done; phase 4 (the design
+doc) is next. Phase 3 still needs the owner's check against a real
+SSM-managed instance.
+
+Phase 3 as built differs from or adds to the text below in these ways:
+- ssh_config `ProxyCommand` runs under `sh -c`, as OpenSSH runs it, with the
+  substituted values `sh_quote`d. Our own `proxy_command` never does unless
+  `proxy_shell = true`.
+- A one-hop ssh_config `ProxyJump` becomes `ssh -W %h:%p <jump>`, using the
+  system `ssh` (and its config) for the jump host, like OpenSSH's `-J`.
+- Precedence: a host's `proxy_command`, then `proxy_rules` (unlisted names
+  only), then ssh_config. A `proxy_rules` match counts as configured when
+  `allow_unlisted_hosts = false`: the rule is an explicit opt-in.
+- The proxy's whole process group is killed (via `libc::kill`, a new direct
+  dependency already in the tree), so `session-manager-plugin` doesn't
+  outlive `aws`. Connections are also closed explicitly on shutdown.
 
 Phase 2 as built differs from the text below in these ways:
 - Host keys are looked up under `HostName` (or `HostKeyAlias`), not under the
@@ -9,7 +24,7 @@ Phase 2 as built differs from the text below in these ways:
   up without a port, also as OpenSSH does.
 - `Include` is supported (globs in the last path component, depth 16), because
   work configs commonly split hosts into `config.d/`.
-- Hosts whose ssh_config sets `ProxyCommand`/`ProxyJump` are refused with an
+- Hosts whose ssh_config sets `ProxyCommand`/`ProxyJump` were refused with an
   explanation until phase 3, rather than connected to directly.
 - A passphrase-protected `key_file` stops startup only when `key_file` is the
   sole auth method; with `agent` also listed, the agent is expected to hold it.

@@ -16,13 +16,13 @@ jobs:
       - run: cargo clippy --release --all-targets --locked -- -D warnings
       - run: cargo test --release --locked
       - run: cargo package --locked
-  auth-integration:
+  integration:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install -y --no-install-recommends openssh-server openssh-client && sudo mkdir -p /run/sshd
+      - run: sudo apt-get install -y --no-install-recommends openssh-server openssh-client netcat-openbsd && sudo mkdir -p /run/sshd
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release --locked --test auth -- --ignored --test-threads=1
+      - run: cargo test --release --locked --test auth --test proxy -- --ignored --test-threads=1
   msrv:
     runs-on: ubuntu-latest
     steps:

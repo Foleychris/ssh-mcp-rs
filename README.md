@@ -137,10 +137,56 @@ unlisted (see `allow_unlisted_hosts`).
 Host keys are checked under the host's `HostName`, or under `HostKeyAlias` when set (looked up
 without a port, as OpenSSH does).
 
-**Proxies aren't supported yet.** A host whose ssh_config sets `ProxyCommand` or `ProxyJump` is
-refused rather than connected to directly, since that could bypass a bastion. Support (which
-covers AWS SSM, bastions and `cloudflared access ssh`) is planned; see
-`docs/proposals/stdio-and-ssm.md`.
+## Proxies, bastions and AWS SSM
+
+A host can be reached through a local command whose stdin and stdout carry the SSH connection,
+like OpenSSH's `ProxyCommand`. Pooling, concurrent runs, the file tools and `cancel_run` work the
+same through it.
+
+```toml
+# One host through AWS Systems Manager (placeholder instance ID):
+[hosts.build]
+address = "i-0123456789abcdef0"
+proxy_command = "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p"
+connect_timeout_secs = 45            # starting an SSM session can take several seconds
+
+# Every unlisted EC2 instance ID through SSM, without a [hosts] entry each:
+[[proxy_rules]]
+match = "^i-[0-9a-f]{8,17}$"
+proxy_command = "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p"
+connect_timeout_secs = 45
+
+# Through a bastion:
+[hosts.inner]
+address = "10.20.0.5"
+proxy_command = "ssh -W %h:%p bastion.example.com"
+```
+
+- **Tokens:** `%h` (address), `%p` (port), `%r` (user), `%%`.
+- **No shell by default.** The template is split into words the way a shell would (quotes
+  work), and values are substituted into each word, so a value is always exactly one argument.
+  Substituted values must look like host names, ports and user names; anything else is refused.
+  `proxy_shell = true` runs the template under `sh -c` instead, for pipes or redirects, with the
+  values shell-quoted.
+- **Precedence:** a host's `proxy_command`, then `[[proxy_rules]]` (unlisted names only, first
+  regex match wins; a match also counts as configured when `allow_unlisted_hosts = false`), then
+  ssh_config. From ssh_config, `ProxyCommand` runs under `sh -c` as in OpenSSH (values quoted),
+  and a one-hop `ProxyJump` becomes `ssh -W %h:%p <jump host>`: the jump host is authenticated
+  and its key checked by your system `ssh` and its own config.
+- **Processes:** one proxy per pooled connection. Its whole process group is stopped when the
+  connection closes or dies, or the server exits (an SSM session runs `session-manager-plugin`
+  under `aws`). It inherits the environment, so `AWS_PROFILE`, `AWS_REGION` and `SSH_AUTH_SOCK`
+  work. `connect_timeout_secs` (per host or rule) covers proxy start-up plus the SSH handshake.
+- **Errors** include the proxy's exit status and the last lines of its stderr, e.g.
+  `TargetNotConnected` or `SessionManagerPlugin is not found`.
+- **Host keys** are checked under the address (e.g. the instance ID) as for direct hosts, or
+  under `HostKeyAlias`. OpenSSH records proxied hosts the same way, so an entry it wrote in
+  `~/.ssh/known_hosts` works; `host_key_policy = "accept-new"` learns new ones.
+
+For SSM you need the AWS CLI v2 and the Session Manager plugin installed locally, credentials
+for it (a profile, environment variables or an instance role), `ssm:StartSession` on the
+instance and on the `AWS-StartSSHSession` document, and on the instance the SSM agent, sshd and
+your key in `authorized_keys`.
 
 ## Tools
 
@@ -178,7 +224,8 @@ TOML; unknown keys are rejected. CONFIG defaults to `$SSH_MCP_CONFIG`, then
 | `stdio_on_exit` | `"cancel"` | stdio only: `"cancel"` or `"leave"` active runs on exit. |
 | `listen` | `"127.0.0.1:8011"` | HTTP only. |
 | `auth_token`, `allow_query_token`, `allow_unauthenticated`, `allowed_origins` | none, `false`, `false`, claude.ai + claude.com | HTTP only; see above. |
-| `[hosts.NAME]` | | `address` (required), `port`, `user`, `description`. |
+| `[hosts.NAME]` | | `address` (required), `port`, `user`, `description`, `proxy_command`, `proxy_shell`, `connect_timeout_secs`. |
+| `[[proxy_rules]]` | none | `match` (regex), `proxy_command`, `proxy_shell`, `connect_timeout_secs`. See [Proxies](#proxies-bastions-and-aws-ssm). |
 | `[limits]` | | See below. |
 
 `[limits]` (defaults): `max_concurrent_runs` 256, `channels_per_conn` 6, `max_conns_per_host` 6,
@@ -207,8 +254,7 @@ if the key's user has passwordless sudo. Treat access to it like access to the k
   channel. Use `nohup` or `systemd-run` for jobs that must outlive it.
 - sshd `MaxSessions` (default 10) caps channels per connection; `channels_per_conn = 6` leaves
   headroom. A refused channel is retried with backoff.
-- No `ProxyCommand` / `ProxyJump` (so no AWS SSM or bastions) yet: such hosts are refused.
-  Planned in `docs/proposals/stdio-and-ssm.md`.
+- `ProxyJump` with more than one hop is refused; use a `proxy_command` instead.
 - No password or keyboard-interactive auth, and no ssh_config `Match` blocks.
 
 ## Development
@@ -218,8 +264,8 @@ cargo test --release     # unit tests
 cargo clippy --release --all-targets -- -D warnings
 ```
 
-`tests/auth.rs` starts its own throwaway sshd and ssh-agent (needs OpenSSH installed):
-`cargo test --release --test auth -- --ignored --test-threads=1`.
+`tests/auth.rs` and `tests/proxy.rs` start their own throwaway sshd and ssh-agent (needs OpenSSH
+and `nc`): `cargo test --release --test auth --test proxy -- --ignored --test-threads=1`.
 `tests/stdio.rs` is an integration test against a real host (never production):
 `SSH_MCP_TEST_CONFIG=… SSH_MCP_TEST_HOST=… cargo test --release --test stdio -- --ignored --test-threads=1`.
 Contributor notes are in `AGENTS.md`.

@@ -21,12 +21,15 @@ auth bypass, injection or host-key weakness is critical**.
 | `src/config.rs` | TOML config + env overrides, startup validation (token rules, limits) |
 | `src/mcp.rs` | MCP Streamable HTTP: auth/Origin gate (middleware), 2026-07-28 stateless + legacy `initialize` eras, SSE for `tools/call`, audit log of calls |
 | `src/ssh.rs` | Connection pool (multiplexed channels per connection, per-host semaphores, separate control pool for kills), host resolution (`[hosts]` + ssh_config), host-key verification (fail closed) |
+| `src/proxy.rs` | ProxyCommand transport: template splitting and substitution (no shell unless `proxy_shell`), spawning, stderr tail, process-group kill; unit tests |
 | `src/sshauth.rs` | Client auth: ssh-agent identities and key files, OpenSSH certificates, capped at 5 offers per connection |
 | `src/sshconfig.rs` | `~/.ssh/config` subset parser (Host/Include, HostName/User/Port/IdentityFile/CertificateFile/IdentitiesOnly/ProxyCommand/ProxyJump/HostKeyAlias); unit tests |
 | `src/runs.rs` | Run lifecycle: queue → run → finish, output ring buffers, cancel/timeout via remote process-group kill, reaper and memory budget, `sh_quote`, `wrap()` |
 | `src/tools.rs` | Tool schemas + handlers (`execute_command`, `get_run`, `list_runs`, `cancel_run`, `write_file`, info tools); `ToolOut` |
 | `src/stdio.rs` | stdio transport: newline-delimited JSON-RPC, one stdout writer, `notifications/cancelled`, exit handling (`stdio_on_exit`) |
 | `src/fileops.rs` | `read_file`, `edit_file` (multi-edit, all-or-nothing), shared helpers (`run_collect`, `copy_staged`, `check_path`); unit tests |
+| `tests/common/` | Shared harness: throwaway sshd + ssh-agent, stdio session helpers |
+| `tests/proxy.rs` | Ignored-by-default integration tests through `nc` as a proxy: all tools, proxy_rules, ssh_config ProxyCommand, failures, timeouts, injection |
 | `tests/auth.rs` | Ignored-by-default integration tests that start their own sshd + ssh-agent: agent, certificates, passphrase keys, MaxAuthTries cap, ssh_config |
 | `tests/stdio.rs` | Ignored-by-default integration test of `--stdio` against a real host (`SSH_MCP_TEST_CONFIG`, `SSH_MCP_TEST_HOST`) |
 | `Dockerfile` | Multi-stage build; `cargo test --release` gates the image |
@@ -87,6 +90,10 @@ the tests at your server. Never point them at a production instance.
   `sh_quote`** or is a validated integer, octal mode or hex digest. Content and
   data travel over stdin, never in the command string. Commands and paths
   containing NUL are rejected (a NUL makes sshd drop the shared connection).
+- Proxy commands never run through a shell unless `proxy_shell` (or ssh_config
+  `ProxyCommand`, as in OpenSSH) asks for one; then substituted values are
+  `sh_quote`d. Substituted values are validated either way. A proxy's whole
+  process group dies with its connection.
 - Host keys fail closed. A key must exactly match a recorded one; a key of a
   different type than the recorded one is refused (downgrade); an unreadable
   known_hosts file is refused. accept-new only learns hosts that are completely
