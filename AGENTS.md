@@ -23,7 +23,9 @@ auth bypass, injection or host-key weakness is critical**.
 | `src/ssh.rs` | Connection pool (multiplexed channels per connection, per-host semaphores, separate control pool for kills), host-key verification (fail closed) |
 | `src/runs.rs` | Run lifecycle: queue → run → finish, output ring buffers, cancel/timeout via remote process-group kill, reaper and memory budget, `sh_quote`, `wrap()` |
 | `src/tools.rs` | Tool schemas + handlers (`execute_command`, `get_run`, `list_runs`, `cancel_run`, `write_file`, info tools); `ToolOut` |
+| `src/stdio.rs` | stdio transport: newline-delimited JSON-RPC, one stdout writer, `notifications/cancelled`, exit handling (`stdio_on_exit`) |
 | `src/fileops.rs` | `read_file`, `edit_file` (multi-edit, all-or-nothing), shared helpers (`run_collect`, `copy_staged`, `check_path`); unit tests |
+| `tests/stdio.rs` | Ignored-by-default integration test of `--stdio` against a real host (`SSH_MCP_TEST_CONFIG`, `SSH_MCP_TEST_HOST`) |
 | `Dockerfile` | Multi-stage build; `cargo test --release` gates the image |
 
 ## Build and test
