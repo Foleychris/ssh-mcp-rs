@@ -1,5 +1,5 @@
-//! MCP JSON-RPC (both eras) and its Streamable HTTP transport. The protocol
-//! layer ([`dispatch`] / [`handle_message`]) is transport-agnostic.
+//! MCP JSON-RPC (both eras) and its Streamable HTTP transport. The stdio
+//! transport (src/stdio.rs) reuses [`dispatch`] / [`handle_message`].
 //! Serves both eras on one endpoint:
 //!  * 2026-07-28 (stateless; per-request `_meta` + mirrored headers, `server/discover`)
 //!  * 2024-11-05 … 2025-11-25 (`initialize` handshake), handled statelessly —
@@ -288,8 +288,6 @@ impl CallCtx {
         Self { peer: peer.ip().to_string(), client, run_sink: None }
     }
 
-    /// For the stdio transport (and protocol unit tests).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn stdio(run_sink: Option<crate::runs::RunSink>) -> Self {
         Self { client: "stdio".into(), peer: "-".into(), run_sink }
     }

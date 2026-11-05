@@ -51,6 +51,58 @@ One endpoint, `POST /mcp` (`GET`/`DELETE` → 405). Era is chosen per request:
 Tasks extension (`io.modelcontextprotocol/tasks`) is **not** implemented: async is exposed as
 ordinary tools (run_id handle pattern), which works with every client today.
 
+## Running locally (stdio)
+
+`ssh-mcp-rs --stdio [CONFIG]` serves MCP over stdin/stdout (newline-delimited JSON-RPC) for a
+local client such as Claude Code. There is no network listener and no auth: the process that
+spawns it is the client. `listen`, `auth_token`, `SSH_MCP_TOKEN*`, `allowed_origins` and
+`allow_query_token` are ignored; every other key means the same as over HTTP, so an HTTP config
+works unchanged. CONFIG defaults to `$SSH_MCP_CONFIG`, then `$XDG_CONFIG_HOME/ssh-mcp-rs/config.toml`,
+then `~/.config/ssh-mcp-rs/config.toml`.
+
+```toml
+# ~/.config/ssh-mcp-rs/config.toml
+default_user = "ubuntu"
+key_file = "/home/me/.ssh/id_ed25519"
+known_hosts_files = ["/home/me/.ssh/known_hosts"]
+learned_hosts_file = "/home/me/.config/ssh-mcp-rs/known_hosts.learned"
+host_key_policy = "strict"          # or "accept-new" (trust on first use)
+stdio_on_exit = "cancel"            # default; "leave" keeps runs going when the client exits
+
+[hosts.build]
+address = "build.example.internal"
+description = "build box"
+```
+
+Register it with Claude Code:
+
+```
+claude mcp add ssh -- /path/to/ssh-mcp-rs --stdio
+claude mcp add --scope user ssh -- /path/to/ssh-mcp-rs --stdio /path/to/config.toml
+```
+
+Behaviour over stdio:
+- Both eras: the legacy `initialize` handshake, and 2026-07-28 clients sending `server/discover`
+  and `_meta` per request (no HTTP headers to mirror). `ping` is supported.
+- Requests run concurrently; responses can come back out of order, matched by id. In-flight
+  requests are capped at `limits.max_pending_runs`. Logs go to stderr only.
+- A line longer than `limits.max_body_bytes` gets an error and is discarded; a malformed line gets
+  a parse error. Neither ends the session.
+- `notifications/cancelled` cancels the runs that request started (same as `cancel_run`), and
+  that request gets no response.
+- On stdin EOF or SIGTERM/SIGINT the server stops reading, lets in-flight requests finish for up
+  to 5 s, then (by default) cancels every still-active run, killing its remote process group,
+  and exits 0. `stdio_on_exit = "leave"` leaves them running instead; every one is logged either
+  way. Runs live in memory, so their output is gone once the server exits.
+- `limits.max_wait_secs` may be up to 600 in stdio mode (220 over HTTP, which is capped
+  because of claude.ai's ~230 s tool-call timeout). The default stays 90.
+- Audit log lines carry `client="stdio"`; the parent PID is logged once at startup.
+
+Integration test, against a throwaway sshd or a test host (never production):
+`SSH_MCP_TEST_CONFIG=… SSH_MCP_TEST_HOST=… cargo test --release --test stdio -- --ignored --test-threads=1`.
+It covers the handshake, 20 concurrent calls, `notifications/cancelled`, and both
+`stdio_on_exit` settings.
+
 ## Audit log
 
 Every tool call, run start (full command, host, user, sudo) and run finish (status, exit, duration),

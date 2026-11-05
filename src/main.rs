@@ -3,6 +3,7 @@ mod fileops;
 mod mcp;
 mod runs;
 mod ssh;
+mod stdio;
 mod tools;
 
 use anyhow::Context;
@@ -11,7 +12,7 @@ use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use config::Config;
+use config::{Config, Mode};
 use runs::Runs;
 use serde_json::json;
 use ssh::Pool;
@@ -46,7 +47,7 @@ async fn health(State(app): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install SIGTERM handler");
@@ -55,6 +56,40 @@ async fn shutdown_signal() {
         _ = term.recv() => {},
     }
     info!("shutting down");
+}
+
+const USAGE: &str = "usage: ssh-mcp-rs [--stdio] [CONFIG]\n\n\
+  (default)  serve MCP over Streamable HTTP on `listen` (POST /mcp)\n\
+  --stdio    serve MCP over stdin/stdout for a local client; no network listener\n\n\
+CONFIG defaults to $SSH_MCP_CONFIG, then /etc/ssh-mcp-rs/config.toml (HTTP) or\n\
+$XDG_CONFIG_HOME/ssh-mcp-rs/config.toml, ~/.config/ssh-mcp-rs/config.toml (stdio).";
+
+/// `[--stdio] [CONFIG]`, in any order. Unknown flags are an error rather than
+/// being taken for a config path.
+fn parse_args(args: impl Iterator<Item = String>) -> Result<(Mode, Option<String>), String> {
+    let mut mode = Mode::Http;
+    let mut path = None;
+    for a in args {
+        match a.as_str() {
+            "--stdio" => mode = Mode::Stdio,
+            "-h" | "--help" => return Err("ssh-mcp-rs: MCP server for running commands over SSH".into()),
+            f if f.starts_with('-') => return Err(format!("unknown option {f:?}")),
+            _ if path.is_some() => return Err("more than one config path given".into()),
+            _ => path = Some(a),
+        }
+    }
+    Ok((mode, path))
+}
+
+fn default_config(mode: Mode) -> String {
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok().filter(|v| !v.is_empty());
+    let home = std::env::var("HOME").ok().filter(|v| !v.is_empty());
+    match (mode, xdg, home) {
+        (Mode::Http, _, _) => "/etc/ssh-mcp-rs/config.toml".into(),
+        (Mode::Stdio, Some(x), _) => format!("{x}/ssh-mcp-rs/config.toml"),
+        (Mode::Stdio, None, Some(h)) => format!("{h}/.config/ssh-mcp-rs/config.toml"),
+        (Mode::Stdio, None, None) => "/etc/ssh-mcp-rs/config.toml".into(),
+    }
 }
 
 #[tokio::main]
@@ -68,11 +103,15 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let path = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("SSH_MCP_CONFIG").ok())
-        .unwrap_or_else(|| "/etc/ssh-mcp-rs/config.toml".into());
-    let cfg = Arc::new(Config::load(path.as_ref())?);
+    let (mode, path) = match parse_args(std::env::args().skip(1)) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let path = path.or_else(|| std::env::var("SSH_MCP_CONFIG").ok()).unwrap_or_else(|| default_config(mode));
+    let cfg = Arc::new(Config::load(path.as_ref(), mode)?);
     let pool = Arc::new(Pool::new(cfg.clone())?);
     let runs = Runs::new(pool.clone(), cfg.clone());
     runs.spawn_reaper();
@@ -83,6 +122,10 @@ async fn main() -> anyhow::Result<()> {
         runs,
         started: Instant::now(),
     });
+
+    if mode == Mode::Stdio {
+        return stdio::serve(app).await;
+    }
 
     let router = Router::new()
         .route(
@@ -139,5 +182,20 @@ pub(crate) mod tests {
         let pool = Arc::new(Pool::new(cfg.clone()).unwrap());
         let runs = Runs::new(pool.clone(), cfg.clone());
         Arc::new(AppState { cfg, pool, runs, started: Instant::now() })
+    }
+
+    fn args(v: &[&str]) -> Result<(Mode, Option<String>), String> {
+        parse_args(v.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn cli_args() {
+        assert_eq!(args(&[]), Ok((Mode::Http, None)));
+        assert_eq!(args(&["c.toml"]), Ok((Mode::Http, Some("c.toml".into()))));
+        assert_eq!(args(&["--stdio"]), Ok((Mode::Stdio, None)));
+        assert_eq!(args(&["--stdio", "c.toml"]), Ok((Mode::Stdio, Some("c.toml".into()))));
+        assert_eq!(args(&["c.toml", "--stdio"]), Ok((Mode::Stdio, Some("c.toml".into()))));
+        assert!(args(&["--stdo"]).is_err());
+        assert!(args(&["a", "b"]).is_err());
     }
 }

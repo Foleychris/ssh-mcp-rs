@@ -15,6 +15,33 @@ pub enum HostKeyPolicy {
     AcceptNew,
 }
 
+/// What a stdio server does with still-active runs when its client goes away.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnExit {
+    /// Kill each run's remote process group, so nothing is orphaned.
+    #[default]
+    Cancel,
+    /// Leave remote processes running (their output is lost with the server).
+    Leave,
+}
+
+/// Which transport the server runs. Selects which startup checks apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Http,
+    Stdio,
+}
+
+/// `max_wait_secs` ceiling. Over HTTP, claude.ai gives up on a tool call at
+/// ~230s; a local stdio client has no such proxy in the way.
+pub fn max_wait_cap(mode: Mode) -> u64 {
+    match mode {
+        Mode::Http => 220,
+        Mode::Stdio => 600,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostCfg {
@@ -116,6 +143,9 @@ pub struct Config {
     /// Parity with the old Python server's regex gate (confirm=true required).
     #[serde(default)]
     pub require_confirm_for_destructive: bool,
+    /// stdio mode only: what to do with active runs when the client exits.
+    #[serde(default)]
+    pub stdio_on_exit: OnExit,
     #[serde(default)]
     pub hosts: BTreeMap<String, HostCfg>,
     #[serde(default)]
@@ -142,11 +172,46 @@ fn d_true() -> bool {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &Path, mode: Mode) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         let mut cfg: Config =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        match mode {
+            Mode::Http => cfg.http_auth_checks()?,
+            // No network listener: listen, the token and allowed_origins don't apply.
+            Mode::Stdio => cfg.auth_token = None,
+        }
+        for f in &cfg.known_hosts_files {
+            std::fs::File::open(f)
+                .with_context(|| format!("known_hosts file {} is missing or unreadable", f.display()))?;
+        }
+        let l = &cfg.limits;
+        if l.channels_per_conn == 0 || l.max_conns_per_host == 0 || l.max_concurrent_runs == 0 || l.max_pending_runs == 0 {
+            bail!("limits must be non-zero");
+        }
+        // File tools read whole files (edit_file up to 4 MiB, images up to 5 MiB)
+        // through the run output buffer, which drops oldest bytes beyond this.
+        if l.retained_output_bytes < 6 * 1024 * 1024 {
+            bail!("limits.retained_output_bytes must be at least 6 MiB (file tools read whole files through it)");
+        }
+        if l.retained_output_bytes < l.inline_output_bytes {
+            bail!("limits.retained_output_bytes must be >= limits.inline_output_bytes");
+        }
+        let cap = max_wait_cap(mode);
+        if l.max_wait_secs > cap {
+            match mode {
+                Mode::Http => bail!("limits.max_wait_secs must be <= {cap} (claude.ai times out tool calls at ~230s)"),
+                Mode::Stdio => bail!("limits.max_wait_secs must be <= {cap} in stdio mode"),
+            }
+        }
+        Ok(cfg)
+    }
+
+    /// HTTP-mode token handling and startup refusals (env overrides, minimum
+    /// token length, no token on a non-loopback address).
+    fn http_auth_checks(&mut self) -> Result<()> {
+        let cfg = self;
         if let Ok(t) = std::env::var("SSH_MCP_TOKEN")
             && !t.trim().is_empty() {
                 cfg.auth_token = Some(t.trim().to_string());
@@ -181,25 +246,6 @@ impl Config {
                 cfg.listen
             );
         }
-        for f in &cfg.known_hosts_files {
-            std::fs::File::open(f)
-                .with_context(|| format!("known_hosts file {} is missing or unreadable", f.display()))?;
-        }
-        let l = &cfg.limits;
-        if l.channels_per_conn == 0 || l.max_conns_per_host == 0 || l.max_concurrent_runs == 0 || l.max_pending_runs == 0 {
-            bail!("limits must be non-zero");
-        }
-        // File tools read whole files (edit_file up to 4 MiB, images up to 5 MiB)
-        // through the run output buffer, which drops oldest bytes beyond this.
-        if l.retained_output_bytes < 6 * 1024 * 1024 {
-            bail!("limits.retained_output_bytes must be at least 6 MiB (file tools read whole files through it)");
-        }
-        if l.retained_output_bytes < l.inline_output_bytes {
-            bail!("limits.retained_output_bytes must be >= limits.inline_output_bytes");
-        }
-        if l.max_wait_secs > 220 {
-            bail!("limits.max_wait_secs must be <= 220 (claude.ai times out tool calls at ~230s)");
-        }
-        Ok(cfg)
+        Ok(())
     }
 }
