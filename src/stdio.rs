@@ -50,7 +50,16 @@ pub async fn serve(app: Arc<AppState>) -> anyhow::Result<()> {
     );
     info!(target: "audit", client = "stdio", ppid, "stdio session started");
     let input = BufReader::new(tokio::io::stdin());
-    run(app, input, tokio::io::stdout(), crate::shutdown_signal()).await;
+    run(
+        app.clone(),
+        input,
+        tokio::io::stdout(),
+        crate::shutdown_signal(),
+    )
+    .await;
+    // process::exit skips destructors: close connections (and stop proxy
+    // processes) explicitly.
+    app.pool.close_all();
     // tokio's stdin reader is a blocking thread that can't be interrupted; it
     // would keep the runtime alive after a signal. Everything is flushed now.
     std::process::exit(0);

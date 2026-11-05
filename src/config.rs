@@ -71,6 +71,28 @@ pub struct HostCfg {
     pub user: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Reach this host through a local command (e.g. AWS SSM); see `proxy.rs`.
+    #[serde(default)]
+    pub proxy_command: Option<String>,
+    /// Run `proxy_command` under `sh -c` (substituted values are quoted).
+    #[serde(default)]
+    pub proxy_shell: bool,
+    /// Overrides `limits.connect_timeout_secs` (proxy start-up can be slow).
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+}
+
+/// Route unlisted host names matching `match` (a regex) through a proxy.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyRule {
+    #[serde(rename = "match")]
+    pub pattern: String,
+    pub proxy_command: String,
+    #[serde(default)]
+    pub proxy_shell: bool,
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,6 +201,9 @@ pub struct Config {
     pub stdio_on_exit: OnExit,
     #[serde(default)]
     pub hosts: BTreeMap<String, HostCfg>,
+    /// Proxies for unlisted hosts, first match wins.
+    #[serde(default)]
+    pub proxy_rules: Vec<ProxyRule>,
     #[serde(default)]
     pub limits: Limits,
 }
@@ -233,6 +258,24 @@ impl Config {
         cfg.cert_file = cfg.cert_file.as_deref().map(ex);
         if let Some(SshConfigSetting::Path(p)) = &cfg.ssh_config {
             cfg.ssh_config = Some(SshConfigSetting::Path(ex(p)));
+        }
+        for (name, h) in &cfg.hosts {
+            if let Some(t) = &h.proxy_command {
+                crate::proxy::validate(&crate::proxy::ProxySpec {
+                    template: t.clone(),
+                    shell: h.proxy_shell,
+                    source: format!("hosts.{name}"),
+                })?;
+            }
+        }
+        for (i, r) in cfg.proxy_rules.iter().enumerate() {
+            regex::Regex::new(&r.pattern)
+                .with_context(|| format!("proxy_rules[{i}].match {:?}", r.pattern))?;
+            crate::proxy::validate(&crate::proxy::ProxySpec {
+                template: r.proxy_command.clone(),
+                shell: r.proxy_shell,
+                source: format!("proxy_rules[{i}]"),
+            })?;
         }
         let methods = cfg.auth_methods();
         if methods.is_empty() {
@@ -442,6 +485,23 @@ mod tests {
         assert!(load_str("auth = [\"key_file\"]\nssh_config = \"/x\"").is_ok());
         assert!(load_str("cert_file = \"c\"").is_err());
         assert!(load_str("key_file = \"k\"\ncert_file = \"c\"").is_ok());
+    }
+
+    #[test]
+    fn proxy_validation() {
+        let rule =
+            |m: &str, c: &str| format!("[[proxy_rules]]\nmatch = {m:?}\nproxy_command = {c:?}\n");
+        assert!(
+            load_str(&rule(
+                "^i-[0-9a-f]{8,17}$",
+                "aws ssm start-session --target %h"
+            ))
+            .is_ok()
+        );
+        assert!(load_str(&rule("^i-(", "nc %h %p")).is_err(), "bad regex");
+        assert!(load_str(&rule(".*", "nc %z")).is_err(), "bad token");
+        assert!(load_str("[hosts.a]\naddress = \"a\"\nproxy_command = \"nc 'oops\"\n").is_err());
+        assert!(load_str("[hosts.a]\naddress = \"a\"\nproxy_command = \"nc %h %p\"\nconnect_timeout_secs = 60\n").is_ok());
     }
 
     #[test]

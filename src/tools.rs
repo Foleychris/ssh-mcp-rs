@@ -728,6 +728,7 @@ async fn test_conn(app: &Arc<AppState>, args: Value) -> ToolOut {
             if let Some(a) = app.pool.auth_used(&target) {
                 let _ = write!(t, "\nauthenticated with {a}");
             }
+            let _ = write!(t, "\ntransport: {}", target.transport());
             ok(t)
         }
         Ok((code, out, e)) => err(format!(
@@ -738,36 +739,47 @@ async fn test_conn(app: &Arc<AppState>, args: Value) -> ToolOut {
 }
 
 fn list_hosts(app: &Arc<AppState>) -> ToolOut {
+    // One line per host, resolved the same way a call would resolve it.
+    let line = |name: &str, desc: Option<&str>| -> String {
+        let d = desc.map(|d| format!("  — {d}")).unwrap_or_default();
+        match app.pool.resolve(name, None) {
+            Ok(tg) => {
+                let via = match &tg.proxy {
+                    Some(_) => format!("  [{}]", tg.transport()),
+                    None => String::new(),
+                };
+                format!(
+                    "  {name:<10} {}@{}:{}{via}{d}",
+                    tg.user, tg.address, tg.port
+                )
+            }
+            Err(e) => format!("  {name:<10} (error: {e:#})"),
+        }
+    };
     let mut t = String::from("Configured hosts:\n");
     for (k, h) in &app.cfg.hosts {
-        let _ = writeln!(
-            t,
-            "  {k:<10} {}@{}:{}{}",
-            h.user.as_deref().unwrap_or(&app.cfg.default_user),
-            h.address,
-            h.port.unwrap_or(app.cfg.default_port),
-            h.description
-                .as_deref()
-                .map(|d| format!("  — {d}"))
-                .unwrap_or_default()
-        );
+        let _ = writeln!(t, "{}", line(k, h.description.as_deref()));
     }
     let extra = app.pool.ssh_config_hosts();
     if !extra.is_empty() {
         t.push_str("\nFrom ssh_config (resolved on use):\n");
         for name in extra {
-            let line = match app.pool.resolve(&name, None) {
-                Ok(tg) => {
-                    let via = tg
-                        .proxy
-                        .as_ref()
-                        .map(|(k, v)| format!("  — via {k} {v} (not supported yet)"))
-                        .unwrap_or_default();
-                    format!("  {name:<10} {}@{}:{}{via}", tg.user, tg.address, tg.port)
-                }
-                Err(e) => format!("  {name:<10} (error: {e:#})"),
-            };
-            let _ = writeln!(t, "{line}");
+            let _ = writeln!(t, "{}", line(&name, None));
+        }
+    }
+    if !app.cfg.proxy_rules.is_empty() {
+        t.push_str("\nProxy rules for unlisted names:\n");
+        for r in &app.cfg.proxy_rules {
+            let program = shell_words::split(&r.proxy_command)
+                .ok()
+                .and_then(|w| w.into_iter().next())
+                .unwrap_or_default();
+            let _ = writeln!(
+                t,
+                "  {} → proxy: {}",
+                r.pattern,
+                if r.proxy_shell { "sh -c" } else { &program }
+            );
         }
     }
     let stats = app.pool.stats();

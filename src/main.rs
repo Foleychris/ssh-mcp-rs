@@ -1,6 +1,7 @@
 mod config;
 mod fileops;
 mod mcp;
+mod proxy;
 mod runs;
 mod ssh;
 mod sshauth;
@@ -149,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/healthz", get(health))
         .layer(DefaultBodyLimit::max(cfg.limits.max_body_bytes))
-        .with_state(app);
+        .with_state(app.clone());
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
         .await
@@ -165,6 +166,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+    // Stop proxy processes with their connections.
+    app.pool.close_all();
     Ok(())
 }
 

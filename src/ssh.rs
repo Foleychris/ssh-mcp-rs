@@ -5,6 +5,7 @@
 //! `max_conns_per_host`. Callers beyond that queue on a per-host semaphore.
 
 use crate::config::{AuthMethod, Config, HostKeyPolicy};
+use crate::proxy::{ProxyChild, ProxySpec};
 use crate::sshauth::{KeyCache, KeyFile};
 use crate::sshconfig::{Resolved, SshConfig, Tokens};
 use anyhow::{Context, Result, anyhow, bail};
@@ -37,15 +38,38 @@ pub struct Target {
     pub cert_files: Vec<PathBuf>,
     /// ssh_config `IdentitiesOnly`: offer only agent keys matching the identity files.
     pub identities_only: bool,
-    /// ssh_config `ProxyCommand` / `ProxyJump` (not supported yet: refused).
-    pub proxy: Option<(String, String)>,
+    /// Reach the host through this local command instead of a TCP connect.
+    pub proxy: Option<ProxySpec>,
+    /// Per-host / per-rule override of `limits.connect_timeout_secs`.
+    pub connect_timeout_secs: Option<u64>,
 }
 
 impl Target {
+    /// Pool key: connections are shared only between identical targets, so
+    /// the same address with and without a proxy never shares one.
     pub fn key(&self) -> String {
-        match &self.host_key_alias {
-            Some(a) => format!("{}@{}:{}#{a}", self.user, self.address, self.port),
-            None => format!("{}@{}:{}", self.user, self.address, self.port),
+        let mut k = format!("{}@{}:{}", self.user, self.address, self.port);
+        if let Some(a) = &self.host_key_alias {
+            k.push_str(&format!("#{a}"));
+        }
+        if let Some(p) = &self.proxy {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (&p.template, p.shell).hash(&mut h);
+            k.push_str(&format!(
+                " via {}#{:06x}",
+                p.program(),
+                h.finish() & 0xff_ffff
+            ));
+        }
+        k
+    }
+
+    /// "direct", or "proxy: <program> (<source>)", for list_hosts and test_ssh_connection.
+    pub fn transport(&self) -> String {
+        match &self.proxy {
+            None => "direct".into(),
+            Some(p) => format!("proxy: {} ({})", p.program(), p.source),
         }
     }
 
@@ -225,6 +249,8 @@ pub struct Conn {
     pub created: Instant,
     /// How this connection authenticated (fingerprints, no key material).
     pub auth: String,
+    /// The proxy process carrying this connection; dropped (killed) with it.
+    _proxy: Option<std::sync::Mutex<ProxyChild>>,
 }
 
 impl Conn {
@@ -360,9 +386,21 @@ impl Pool {
                 None => Ok(Resolved::default()),
             }
         };
+        // Proxy precedence: [hosts] proxy_command, then proxy_rules (unlisted
+        // names only), then ssh_config ProxyCommand / ProxyJump.
+        let mut proxy: Option<ProxySpec> = None;
+        let mut timeout: Option<u64> = None;
         let (alias, address, port, user, r) = match found {
             Some((alias, hc)) => {
                 let r = sc(alias)?;
+                if let Some(t) = &hc.proxy_command {
+                    proxy = Some(ProxySpec {
+                        template: t.clone(),
+                        shell: hc.proxy_shell,
+                        source: format!("hosts.{alias}"),
+                    });
+                }
+                timeout = hc.connect_timeout_secs;
                 (
                     alias.clone(),
                     hc.address.clone(),
@@ -379,7 +417,16 @@ impl Pool {
                     _ => (h, None),
                 };
                 let r = sc(name)?;
-                if !self.cfg.allow_unlisted_hosts && !r.named {
+                if let Some((i, rule)) = self.rule_for(name) {
+                    proxy = Some(ProxySpec {
+                        template: rule.proxy_command.clone(),
+                        shell: rule.proxy_shell,
+                        source: format!("proxy_rules[{i}]"),
+                    });
+                    timeout = rule.connect_timeout_secs;
+                }
+                // A proxy rule is an explicit opt-in for the names it matches.
+                if !self.cfg.allow_unlisted_hosts && !r.named && proxy.is_none() {
                     let mut known: Vec<String> = self.cfg.hosts.keys().cloned().collect();
                     if let Some(c) = &self.ssh_config {
                         known.extend(c.named_hosts());
@@ -407,7 +454,21 @@ impl Pool {
             identity_files: r.identity_files,
             cert_files: r.certificate_files,
             identities_only: r.identities_only,
-            proxy: r.proxy,
+            proxy: match (proxy, &r.proxy) {
+                (Some(p), _) => Some(p),
+                (None, Some((kind, value))) if kind == "ProxyJump" => {
+                    Some(crate::proxy::jump_spec(value, "ssh_config ProxyJump")?)
+                }
+                (None, Some((_, value))) => Some(ProxySpec {
+                    // OpenSSH runs ProxyCommand through a shell; so do we,
+                    // with the substituted values quoted.
+                    template: value.clone(),
+                    shell: true,
+                    source: "ssh_config ProxyCommand".into(),
+                }),
+                (None, None) => None,
+            },
+            connect_timeout_secs: timeout,
         };
         // As in OpenSSH, identity files are skipped silently when neither the
         // key nor its `.pub` exists (the `.pub` alone still selects agent keys).
@@ -417,6 +478,19 @@ impl Pool {
             p.exists() || std::path::Path::new(&pubp).exists()
         });
         Ok(t)
+    }
+
+    /// The first proxy rule whose regex matches `name`.
+    fn rule_for(&self, name: &str) -> Option<(usize, &crate::config::ProxyRule)> {
+        self.cfg.proxy_rules.iter().enumerate().find(|(_, r)| {
+            // Validated at startup; a failure here can't happen, so treat it as no match.
+            regex::Regex::new(&r.pattern).is_ok_and(|re| re.is_match(name))
+        })
+    }
+
+    /// Drop every pooled connection now (which stops their proxy processes).
+    pub fn close_all(&self) {
+        self.hosts.lock().unwrap().clear();
     }
 
     /// Hosts named in ssh_config (for list_hosts), excluding ones also in `[hosts]`.
@@ -468,25 +542,35 @@ impl Pool {
     }
 
     async fn connect(&self, t: &Target) -> Result<Arc<Conn>> {
-        if let Some((kind, value)) = &t.proxy {
-            bail!(
-                "{} is configured with {kind} {value:?} in ssh_config, and proxies aren't supported yet. \
-                 Nothing was attempted: connecting directly instead could bypass the proxy. Add a [hosts] \
-                 entry with a directly reachable address, or `{kind} none` for this host, to connect directly.",
-                t.alias
-            );
-        }
         let handler = Handler {
             host: t.host_key_name().to_string(),
             port: t.host_key_port(),
             kc: self.kc.clone(),
         };
-        let timeout = Duration::from_secs(self.cfg.limits.connect_timeout_secs);
+        let timeout = Duration::from_secs(
+            t.connect_timeout_secs
+                .unwrap_or(self.cfg.limits.connect_timeout_secs),
+        );
+        let mut proxy_child: Option<ProxyChild> = None;
         let fut = async {
-            let mut handle =
-                client::connect(self.ssh_cfg.clone(), (t.address.as_str(), t.port), handler)
-                    .await
-                    .map_err(|e| anyhow!("connect {}:{}: {e}", t.address, t.port))?;
+            let mut handle = match &t.proxy {
+                None => {
+                    client::connect(self.ssh_cfg.clone(), (t.address.as_str(), t.port), handler)
+                        .await
+                        .map_err(|e| anyhow!("connect {}:{}: {e}", t.address, t.port))?
+                }
+                Some(spec) => {
+                    let argv = crate::proxy::build_argv(spec, &t.address, t.port, &t.user)
+                        .with_context(|| format!("{} proxy_command", spec.source))?;
+                    let (stream, child) = crate::proxy::spawn(&argv)?;
+                    proxy_child = Some(child);
+                    client::connect_stream(self.ssh_cfg.clone(), stream, handler)
+                        .await
+                        .map_err(|e| {
+                            anyhow!("SSH handshake through {} failed: {e}", t.transport())
+                        })?
+                }
+            };
             let how = crate::sshauth::authenticate(
                 &mut handle,
                 t,
@@ -498,9 +582,26 @@ impl Pool {
             .map_err(|e| anyhow!(e))?;
             Ok::<_, anyhow::Error>((handle, how))
         };
-        let (handle, how) = tokio::time::timeout(timeout, fut)
-            .await
-            .map_err(|_| anyhow!("timed out connecting to {} after {timeout:?}", t.alias))??;
+        let res = tokio::time::timeout(timeout, fut).await;
+        let (handle, how) = match res {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                return Err(match proxy_child.as_mut() {
+                    Some(c) => e.context(c.diagnose().await),
+                    None => e,
+                });
+            }
+            Err(_) => {
+                let mut msg = format!("timed out connecting to {} after {timeout:?}", t.alias);
+                if let Some(c) = proxy_child.as_mut() {
+                    msg.push_str(&format!(
+                        " ({}; raise connect_timeout_secs for slow proxies)",
+                        c.diagnose().await
+                    ));
+                }
+                bail!(msg);
+            }
+        };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         info!(conn = id, target = %t.key(), auth = %how, "ssh connection established");
         Ok(Arc::new(Conn {
@@ -510,6 +611,7 @@ impl Pool {
             dead: AtomicBool::new(false),
             created: Instant::now(),
             auth: how,
+            _proxy: proxy_child.map(std::sync::Mutex::new),
         }))
     }
 
