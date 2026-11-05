@@ -224,6 +224,11 @@ cargo clippy --release --all-targets -- -D warnings
 `SSH_MCP_TEST_CONFIG=… SSH_MCP_TEST_HOST=… cargo test --release --test stdio -- --ignored --test-threads=1`.
 Contributor notes are in `AGENTS.md`.
 
+Releasing: bump `version` in `Cargo.toml`, commit, and push a matching tag
+(`git tag -a vX.Y.Z -m "sshmux-mcp X.Y.Z" && git push origin vX.Y.Z`).
+`.github/workflows/release.yml` checks the tag against the version, runs the checks, and
+publishes to crates.io with Trusted Publishing (no stored API token).
+
 ## License
 
 MIT

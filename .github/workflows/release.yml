@@ -1,0 +1,45 @@
+# Publish to crates.io when a version tag (vX.Y.Z) is pushed, using crates.io
+# Trusted Publishing: GitHub's OIDC token is exchanged for a 30-minute
+# crates.io token, so no API token is stored anywhere.
+#
+# crates.io side (crate Settings -> Trusted Publishing -> Add -> GitHub):
+#   owner Foleychris, repository ssh-mcp-rs, workflow release.yml,
+#   environment release.
+# Release: bump `version` in Cargo.toml, commit, then
+#   git tag -a vX.Y.Z -m "sshmux-mcp X.Y.Z" && git push origin vX.Y.Z
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Add protection rules (e.g. required reviewers) to this environment in the
+    # repository settings to approve each publish by hand.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the crates.io exchange
+    steps:
+      # Actions are pinned to commits: this job can publish the crate.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag must match Cargo.toml version
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $v"
+            exit 1
+          fi
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --release --all-targets --locked -- -D warnings
+      - run: cargo test --release --locked
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
