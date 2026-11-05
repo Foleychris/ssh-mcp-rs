@@ -158,14 +158,31 @@ fn d_listen() -> String {
 fn d_origins() -> Vec<String> {
     vec!["https://claude.ai".into(), "https://claude.com".into()]
 }
+/// The local login name, as OpenSSH defaults to. Empty if unknown (then
+/// `load` asks for an explicit `default_user`).
 fn d_user() -> String {
-    "root".into()
+    ["USER", "LOGNAME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+        .unwrap_or_default()
 }
 fn d_port() -> u16 {
     22
 }
 fn d_policy() -> HostKeyPolicy {
-    HostKeyPolicy::AcceptNew
+    HostKeyPolicy::Strict
+}
+
+/// Expand a leading `~` or `~/` with `home`. `~user` forms are left alone.
+fn expand_tilde(p: &Path, home: Option<&str>) -> PathBuf {
+    let Some(home) = home.filter(|h| !h.is_empty()) else { return p.to_path_buf() };
+    match p.to_str() {
+        Some("~") => PathBuf::from(home),
+        Some(s) if s.starts_with("~/") => Path::new(home).join(&s[2..]),
+        _ => p.to_path_buf(),
+    }
 }
 fn d_true() -> bool {
     true
@@ -177,6 +194,14 @@ impl Config {
             .with_context(|| format!("reading config {}", path.display()))?;
         let mut cfg: Config =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let home = std::env::var("HOME").ok();
+        let ex = |p: &Path| expand_tilde(p, home.as_deref());
+        cfg.key_file = ex(&cfg.key_file);
+        cfg.learned_hosts_file = ex(&cfg.learned_hosts_file);
+        cfg.known_hosts_files = cfg.known_hosts_files.iter().map(|p| ex(p)).collect();
+        if cfg.default_user.trim().is_empty() {
+            bail!("default_user is not set and $USER is empty; set default_user in {}", path.display());
+        }
         match mode {
             Mode::Http => cfg.http_auth_checks()?,
             // No network listener: listen, the token and allowed_origins don't apply.
@@ -248,5 +273,33 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tilde_expansion() {
+        let h = Some("/home/me");
+        let e = |p: &str| expand_tilde(Path::new(p), h);
+        assert_eq!(e("~"), PathBuf::from("/home/me"));
+        assert_eq!(e("~/.ssh/id_ed25519"), PathBuf::from("/home/me/.ssh/id_ed25519"));
+        assert_eq!(e("/etc/x"), PathBuf::from("/etc/x"));
+        assert_eq!(e("~other/x"), PathBuf::from("~other/x"));
+        assert_eq!(e("a/~/b"), PathBuf::from("a/~/b"));
+        assert_eq!(expand_tilde(Path::new("~/x"), None), PathBuf::from("~/x"));
+        assert_eq!(expand_tilde(Path::new("~/x"), Some("")), PathBuf::from("~/x"));
+    }
+
+    #[test]
+    fn safe_defaults() {
+        assert_eq!(d_policy(), HostKeyPolicy::Strict);
+        let cfg: Config = toml::from_str("default_user = \"u\"\nkey_file = \"k\"\nlearned_hosts_file = \"l\"\n").unwrap();
+        assert_eq!(cfg.host_key_policy, HostKeyPolicy::Strict);
+        assert_eq!(cfg.stdio_on_exit, OnExit::Cancel);
+        assert_eq!(cfg.listen, "127.0.0.1:8011");
+        assert!(cfg.auth_token.is_none() && !cfg.allow_query_token && !cfg.allow_unauthenticated);
     }
 }

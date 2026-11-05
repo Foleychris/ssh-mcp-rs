@@ -103,7 +103,10 @@ impl KeyCheck {
         }
         match self.policy {
             HostKeyPolicy::Strict => Err(format!(
-                "unknown host key for {host}:{port} ({fp}) and host_key_policy is strict"
+                "unknown host key for {host}:{port} ({fp}) and host_key_policy is strict. Nothing was \
+                 run. Add the host's key to a known_hosts file listed in known_hosts_files (e.g. connect \
+                 once with `ssh`, or `ssh-keyscan -p {port} {host}` after checking the fingerprint), or set \
+                 host_key_policy = \"accept-new\" to trust it on first use"
             )),
             HostKeyPolicy::AcceptNew => {
                 let _g = LEARN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
