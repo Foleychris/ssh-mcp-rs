@@ -361,7 +361,7 @@ impl Runs {
 
     pub fn list(&self) -> Vec<Arc<Run>> {
         let mut v: Vec<_> = self.map.lock().unwrap().values().cloned().collect();
-        v.sort_by(|a, b| b.created.cmp(&a.created));
+        v.sort_by_key(|r| std::cmp::Reverse(r.created));
         v
     }
 

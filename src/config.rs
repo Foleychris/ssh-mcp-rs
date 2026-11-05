@@ -213,9 +213,10 @@ impl Config {
     fn http_auth_checks(&mut self) -> Result<()> {
         let cfg = self;
         if let Ok(t) = std::env::var("SSH_MCP_TOKEN")
-            && !t.trim().is_empty() {
-                cfg.auth_token = Some(t.trim().to_string());
-            }
+            && !t.trim().is_empty()
+        {
+            cfg.auth_token = Some(t.trim().to_string());
+        }
         if let Ok(p) = std::env::var("SSH_MCP_TOKEN_FILE") {
             let t = std::fs::read_to_string(&p).with_context(|| format!("reading {p}"))?;
             if t.trim().is_empty() {
@@ -229,10 +230,10 @@ impl Config {
         if cfg.auth_token.as_deref() == Some("") {
             cfg.auth_token = None;
         }
-        if let Some(t) = &cfg.auth_token {
-            if t.len() < 32 {
-                bail!("auth_token is only {} characters; use at least 32 (e.g. `openssl rand -hex 32`)", t.len());
-            }
+        if let Some(t) = &cfg.auth_token
+            && t.len() < 32
+        {
+            bail!("auth_token is only {} characters; use at least 32 (e.g. `openssl rand -hex 32`)", t.len());
         }
         let loopback = cfg
             .listen

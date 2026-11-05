@@ -187,13 +187,13 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
 
     // Whole image -> image content block the model can look at.
     let whole = a.offset == 0 && size.is_some_and(|sz| sz == data.len() as u64);
-    if enc == "auto" && whole {
-        if let Some(mime) = image_mime(&data) {
-            let n = data.len() as u64;
-            let mut out = ok(format!("{}\n--- image ({mime}, {n} bytes) attached ---", header(n, true)));
-            out.image = Some((mime.to_string(), base64::engine::general_purpose::STANDARD.encode(&data)));
-            return out;
-        }
+    if enc == "auto" && whole
+        && let Some(mime) = image_mime(&data)
+    {
+        let n = data.len() as u64;
+        let mut out = ok(format!("{}\n--- image ({mime}, {n} bytes) attached ---", header(n, true)));
+        out.image = Some((mime.to_string(), base64::engine::general_purpose::STANDARD.encode(&data)));
+        return out;
     }
     let image_note = if enc == "auto" && a.offset == 0 && image_mime(&data).is_some() {
         format!(" — image larger than {} MiB, returned as base64 chunks", IMAGE_MAX / 1024 / 1024)
@@ -203,12 +203,12 @@ pub async fn read_file(app: &Arc<AppState>, args: Value) -> ToolOut {
     data.truncate(len as usize);
     // A chunk boundary may split a multi-byte character: in auto mode, end the
     // chunk at the last complete character and let next_offset resume there.
-    if enc == "auto" && image_note.is_empty() {
-        if let Err(e) = std::str::from_utf8(&data) {
-            let at_eof = size.is_some_and(|sz| a.offset + data.len() as u64 >= sz);
-            if e.error_len().is_none() && !at_eof && e.valid_up_to() > 0 {
-                data.truncate(e.valid_up_to());
-            }
+    if enc == "auto" && image_note.is_empty()
+        && let Err(e) = std::str::from_utf8(&data)
+    {
+        let at_eof = size.is_some_and(|sz| a.offset + data.len() as u64 >= sz);
+        if e.error_len().is_none() && !at_eof && e.valid_up_to() > 0 {
+            data.truncate(e.valid_up_to());
         }
     }
     let n = data.len() as u64;

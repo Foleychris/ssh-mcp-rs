@@ -91,22 +91,22 @@ fn origin_ok(app: &AppState, origin: &str) -> bool {
 fn authorized(app: &AppState, tok: &str, uri: &axum::http::Uri, headers: &HeaderMap) -> bool {
     let ok = |p: &str| constant_time_eq(p.trim().as_bytes(), tok.as_bytes());
     let hv = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
-    if let Some(a) = hv("authorization") {
-        if a.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("bearer ")) && ok(&a[7..]) {
-            return true;
-        }
+    if let Some(a) = hv("authorization")
+        && a.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("bearer ")) && ok(&a[7..])
+    {
+        return true;
     }
     if hv("x-api-key").is_some_and(ok) || hv("x-auth-token").is_some_and(ok) {
         return true;
     }
-    if app.cfg.allow_query_token {
-        if let Some(q) = uri.query() {
-            for pair in q.split('&') {
-                if let Some(v) = pair.strip_prefix("key=") {
-                    if ok(v) {
-                        return true;
-                    }
-                }
+    if app.cfg.allow_query_token
+        && let Some(q) = uri.query()
+    {
+        for pair in q.split('&') {
+            if let Some(v) = pair.strip_prefix("key=")
+                && ok(v)
+            {
+                return true;
             }
         }
     }
@@ -135,18 +135,18 @@ pub async fn gate(
     let headers = req.headers();
     let uri = req.uri();
     let caller = CallCtx::http(peer, headers);
-    if let Some(tok) = &app.cfg.auth_token {
-        if !authorized(&app, tok, uri, headers) {
-            let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-");
-            warn!(target: "audit", client = %caller.client, peer = %caller.peer, user_agent = %crate::runs::truncate(ua, 120),
-                  "rejected request: missing or wrong shared secret");
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Bearer")],
-                "unauthorized",
-            )
-                .into_response();
-        }
+    if let Some(tok) = &app.cfg.auth_token
+        && !authorized(&app, tok, uri, headers)
+    {
+        let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-");
+        warn!(target: "audit", client = %caller.client, peer = %caller.peer, user_agent = %crate::runs::truncate(ua, 120),
+              "rejected request: missing or wrong shared secret");
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "unauthorized",
+        )
+            .into_response();
     }
     if let Some(o) = headers.get(header::ORIGIN) {
         let o = o.to_str().unwrap_or("");
@@ -199,11 +199,12 @@ pub async fn handle(
     if let (Some(v), Some(obj)) = (version.as_deref(), msg.as_object())
         && v == MODERN
         && let (Some(method), Some(id)) = (obj.get("method").and_then(Value::as_str), obj.get("id"))
+
     {
         let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
         if let Some(r) = header_check(&headers, id, method, &params, v) {
-            return r;
-        }
+        return r;
+    }
     }
     let wants_sse = headers
         .get(header::ACCEPT)
