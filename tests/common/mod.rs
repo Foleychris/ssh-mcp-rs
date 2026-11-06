@@ -157,6 +157,22 @@ impl Lab {
         }
     }
 
+    /// `ssh-add -h`: add `key` to the agent, usable only for a server whose
+    /// host key is the one in `host_pub` (OpenSSH destination constraints).
+    pub fn agent_add_constrained(&self, key: &str, host_pub: &Path) {
+        let k = std::fs::read_to_string(host_pub).unwrap();
+        let k: Vec<&str> = k.split_whitespace().take(2).collect();
+        let kh = self.p(&format!("{key}.dest_known_hosts"));
+        std::fs::write(&kh, format!("dest-host {}\n", k.join(" "))).unwrap();
+        run(Command::new("ssh-add")
+            .arg("-q")
+            .arg("-H")
+            .arg(&kh)
+            .args(["-h", "dest-host"])
+            .arg(self.p(key))
+            .env("SSH_AUTH_SOCK", self.sock()));
+    }
+
     pub fn agent_add(&self, key: &str) {
         run(Command::new("ssh-add")
             .arg("-q")
@@ -199,15 +215,45 @@ impl Drop for Lab {
 /// Run the server over stdio, call one tool, return (isError, text). If the
 /// server fails to start, returns (true, its stderr).
 pub fn call(lab: &Lab, cfg: &Path, agent: bool, tool: &str, args: Value) -> (bool, String) {
+    let sock = lab.sock();
+    call_with(cfg, agent.then_some(sock.as_path()), &[], tool, args)
+}
+
+/// Like `call`, with an explicit agent socket (or none) and extra environment.
+pub fn call_with(
+    cfg: &Path,
+    agent_sock: Option<&Path>,
+    env: &[(&str, &str)],
+    tool: &str,
+    args: Value,
+) -> (bool, String) {
+    let (e, t, _) = call_logged(cfg, agent_sock, env, tool, args);
+    (e, t)
+}
+
+/// `call_with`, also returning the server's stderr (its log) and running it
+/// with debug logging for sshmux itself.
+pub fn call_logged(
+    cfg: &Path,
+    agent_sock: Option<&Path>,
+    env: &[(&str, &str)],
+    tool: &str,
+    args: Value,
+) -> (bool, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sshmux-mcp"));
     cmd.args(["--stdio"])
         .arg(cfg)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.env_remove("SSH_AUTH_SOCK").env("RUST_LOG", "warn");
-    if agent {
-        cmd.env("SSH_AUTH_SOCK", lab.sock());
+    cmd.env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSHMUX_TEST_SKIP_SESSION_BIND")
+        .env("RUST_LOG", "warn,sshmux_mcp::sshauth=debug");
+    if let Some(sock) = agent_sock {
+        cmd.env("SSH_AUTH_SOCK", sock);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     let mut child = cmd.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
@@ -217,8 +263,9 @@ pub fn call(lab: &Lab, cfg: &Path, agent: bool, tool: &str, args: Value) -> (boo
     let _ = BufReader::new(child.stdout.take().unwrap()).read_line(&mut line);
     drop(stdin);
     let out = child.wait_with_output().unwrap();
+    let log = String::from_utf8_lossy(&out.stderr).into_owned();
     if line.is_empty() {
-        return (true, String::from_utf8_lossy(&out.stderr).into_owned());
+        return (true, log.clone(), log);
     }
     let v: Value = serde_json::from_str(&line).unwrap();
     let r = &v["result"];
@@ -228,6 +275,7 @@ pub fn call(lab: &Lab, cfg: &Path, agent: bool, tool: &str, args: Value) -> (boo
             .as_str()
             .unwrap_or_default()
             .to_string(),
+        log,
     )
 }
 

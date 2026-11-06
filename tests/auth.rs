@@ -205,3 +205,170 @@ fn ssh_config_alias_identityfile_and_hostkeyalias() {
         "{t}"
     );
 }
+
+const SKIP_BIND: (&str, &str) = ("SSHMUX_TEST_SKIP_SESSION_BIND", "1");
+
+#[test]
+#[ignore]
+fn destination_constrained_agent_key_needs_session_bind() {
+    let mut lab = Lab::new("bind");
+    keygen(&lab.p("k"), "");
+    lab.authorize("k");
+    lab.start_sshd();
+    lab.start_agent();
+    // ssh-add -h: usable only for a server with this lab's host key.
+    lab.agent_add_constrained("k", &lab.p("host_key.pub"));
+    let cfg = lab.config("auth = [\"agent\"]", false);
+    let sock = lab.sock();
+
+    // sshmux binds the agent to the session (session-bind@openssh.com).
+    let (e, t, log) = call_logged(
+        &cfg,
+        Some(&sock),
+        &[],
+        "test_ssh_connection",
+        json!({"hostname": "lab"}),
+    );
+    assert!(
+        !e && t.contains("reachable") && t.contains("agent key"),
+        "{t}"
+    );
+    assert!(log.contains("agent bound to the session"), "{log}");
+
+    // Regression: without the bind, OpenSSH's agent lists the key but
+    // refuses to sign with it, so authentication fails.
+    let (e, t) = call_with(
+        &cfg,
+        Some(&sock),
+        &[SKIP_BIND],
+        "test_ssh_connection",
+        json!({"hostname": "lab"}),
+    );
+    assert!(
+        e && !t.contains("reachable") && t.contains("Nothing was run"),
+        "{t}"
+    );
+}
+
+#[test]
+#[ignore]
+fn agent_key_constrained_to_another_host_is_refused() {
+    // The bind tells the agent which server it is signing for; a key limited
+    // to a different host key must not be used here.
+    let mut lab = Lab::new("bind-other");
+    keygen(&lab.p("k"), "");
+    keygen(&lab.p("other_host_key"), "");
+    lab.authorize("k");
+    lab.start_sshd();
+    lab.start_agent();
+    lab.agent_add_constrained("k", &lab.p("other_host_key.pub"));
+    let cfg = lab.config("auth = [\"agent\"]", false);
+    let (e, t) = call_with(
+        &cfg,
+        Some(&lab.sock()),
+        &[],
+        "test_ssh_connection",
+        json!({"hostname": "lab"}),
+    );
+    assert!(e && !t.contains("reachable"), "{t}");
+}
+
+#[test]
+#[ignore]
+fn unconstrained_agent_key_works_with_or_without_bind() {
+    let mut lab = Lab::new("bind-plain");
+    keygen(&lab.p("k"), "");
+    lab.authorize("k");
+    lab.start_sshd();
+    lab.start_agent();
+    lab.agent_add("k");
+    let cfg = lab.config("auth = [\"agent\"]", false);
+    for env in [&[][..], &[SKIP_BIND][..]] {
+        let (e, t) = call_with(
+            &cfg,
+            Some(&lab.sock()),
+            env,
+            "test_ssh_connection",
+            json!({"hostname": "lab"}),
+        );
+        assert!(!e && t.contains("agent key"), "env {env:?}: {t}");
+    }
+}
+
+/// An ssh-agent that doesn't know session-bind@openssh.com: russh's own agent
+/// server answers any extension with SSH_AGENT_FAILURE.
+#[derive(Clone)]
+struct ExtensionlessAgent;
+impl russh::keys::agent::server::Agent for ExtensionlessAgent {}
+
+#[test]
+#[ignore]
+fn agent_without_session_bind_extension_still_works() {
+    let mut lab = Lab::new("bind-noext");
+    keygen(&lab.p("k"), "");
+    lab.authorize("k");
+    lab.start_sshd();
+    let sock = lab.p("noext-agent.sock");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = rt
+        .block_on(async { tokio::net::UnixListener::bind(&sock) })
+        .unwrap();
+    rt.spawn(async move {
+        let incoming = Box::pin(futures::stream::unfold(listener, |l| async move {
+            Some((l.accept().await.map(|(s, _)| s), l))
+        }));
+        russh::keys::agent::server::serve(incoming, ExtensionlessAgent).await
+    });
+    let key = russh::keys::load_secret_key(lab.p("k"), None).unwrap();
+    rt.block_on(async {
+        let mut c = russh::keys::agent::client::AgentClient::connect_uds(&sock)
+            .await
+            .unwrap();
+        // Confirm the premise: this agent rejects the extension.
+        let ids = c.request_identities().await.unwrap();
+        assert!(ids.is_empty());
+        c.add_identity(&key, &[]).await.unwrap();
+    });
+    let cfg = lab.config("auth = [\"agent\"]", false);
+    let (e, t, log) = call_logged(
+        &cfg,
+        Some(&sock),
+        &[],
+        "test_ssh_connection",
+        json!({"hostname": "lab"}),
+    );
+    assert!(!e && t.contains("agent key"), "{t}");
+    // The bind was attempted, refused by the agent, and auth carried on.
+    assert!(log.contains("agent did not accept session-bind"), "{log}");
+}
+
+#[test]
+#[ignore]
+fn destination_constrained_agent_key_through_a_proxy() {
+    // The binding is at the SSH layer, so a ProxyCommand changes nothing.
+    let mut lab = Lab::new("bind-proxy");
+    keygen(&lab.p("k"), "");
+    lab.authorize("k");
+    lab.start_sshd();
+    lab.start_agent();
+    lab.agent_add_constrained("k", &lab.p("host_key.pub"));
+    let cfg = lab.config(
+        &format!(
+            "auth = [\"agent\"]\n[hosts.viaproxy]\naddress = \"127.0.0.1\"\nport = {}\nproxy_command = \"nc %h %p\"\n",
+            lab.port
+        ),
+        true,
+    );
+    let (e, t, log) = call_logged(
+        &cfg,
+        Some(&lab.sock()),
+        &[],
+        "test_ssh_connection",
+        json!({"hostname": "viaproxy"}),
+    );
+    assert!(
+        !e && t.contains("agent key") && t.contains("proxy: nc"),
+        "{t}"
+    );
+    assert!(log.contains("agent bound to the session"), "{log}");
+}

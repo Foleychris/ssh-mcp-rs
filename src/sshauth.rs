@@ -12,6 +12,43 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+use tracing::debug;
+
+/// Test-only: skip `session-bind@openssh.com`, to show that
+/// destination-constrained agent keys depend on it (tests/auth.rs).
+const SKIP_SESSION_BIND_ENV: &str = "SSHMUX_TEST_SKIP_SESSION_BIND";
+
+/// Bind this agent connection to the SSH session being authenticated
+/// (`session-bind@openssh.com`, OpenSSH PROTOCOL.agent), as `ssh` does. Agents
+/// that enforce destination constraints (`ssh-add -h`) hide or refuse to use a
+/// constrained key on an unbound connection. Not fatal: agents without the
+/// extension answer with a failure, and only the signature decides. Returns
+/// whether the agent accepted it.
+async fn bind_agent_session(
+    agent: &mut AgentClient<tokio::net::UnixStream>,
+    handle: &client::Handle<Handler>,
+    t: &Target,
+) -> bool {
+    if std::env::var_os(SKIP_SESSION_BIND_ENV).is_some() {
+        debug!(host = %t.alias, "session-bind skipped ({SKIP_SESSION_BIND_ENV} is set)");
+        return false;
+    }
+    let Some(binding) = handle.agent_session_binding() else {
+        debug!(host = %t.alias, "no agent session binding available; not binding the agent");
+        return false;
+    };
+    // forwarding = false: this is direct client auth, not a forwarded socket.
+    match agent.bind_session(binding, false).await {
+        Ok(()) => {
+            debug!(host = %t.alias, "agent bound to the session (session-bind@openssh.com)");
+            true
+        }
+        Err(e) => {
+            debug!(host = %t.alias, "agent did not accept session-bind ({e}); continuing unbound");
+            false
+        }
+    }
+}
 
 /// A key file, loaded once and cached.
 #[derive(Clone)]
@@ -200,6 +237,8 @@ pub async fn authenticate(
                         continue;
                     }
                 };
+                // Before listing: a constrained key is only visible once bound.
+                let bound = bind_agent_session(&mut agent, handle, t).await;
                 let ids = match agent.request_identities().await {
                     Ok(ids) => ids,
                     Err(e) => {
@@ -208,7 +247,11 @@ pub async fn authenticate(
                     }
                 };
                 if ids.is_empty() {
-                    tried.push("ssh-agent holds no identities (ssh-add -l)".into());
+                    tried.push(if bound {
+                        "ssh-agent offers no identities for this host (ssh-add -l; keys added with ssh-add -h are limited to their hosts)".into()
+                    } else {
+                        "ssh-agent holds no identities (ssh-add -l), or only keys limited to other hosts".into()
+                    });
                     continue;
                 }
                 let preferred: Vec<PublicKey> = key_files
