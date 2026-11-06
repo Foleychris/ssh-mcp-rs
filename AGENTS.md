@@ -32,6 +32,7 @@ auth bypass, injection or host-key weakness is critical**.
 | `tests/proxy.rs` | Ignored-by-default integration tests through `nc` as a proxy: all tools, proxy_rules, ssh_config ProxyCommand, failures, timeouts, injection |
 | `tests/auth.rs` | Ignored-by-default integration tests that start their own sshd + ssh-agent: agent, certificates, passphrase keys, MaxAuthTries cap, ssh_config |
 | `tests/stdio.rs` | Ignored-by-default integration test of `--stdio` against a real host (`SSH_MCP_TEST_CONFIG`, `SSH_MCP_TEST_HOST`) |
+| `.github/workflows/` | `ci.yml` (fmt, clippy, tests, package, MSRV, integration); `release.yml` (tag-triggered publish, and the Friday Dependabot auto-release via `.github/scripts/dependabot-release.sh`) |
 | `Dockerfile` | Multi-stage build; `cargo test --release` gates the image |
 
 ## Build and test

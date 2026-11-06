@@ -275,6 +275,11 @@ Releasing: bump `version` in `Cargo.toml`, commit, and push a matching tag
 `.github/workflows/release.yml` checks the tag against the version, runs the checks, and
 publishes to crates.io with Trusted Publishing (no stored API token).
 
+Dependency updates release themselves: every Friday night the same workflow merges Dependabot
+PRs that only change `Cargo.lock` and have passed CI, and if those are the only changes to the
+crate since the last release, it bumps the patch version, re-runs the checks, tags and publishes.
+Updates that touch `Cargo.toml` (major versions) or the workflows wait for a human.
+
 ## License
 
 MIT

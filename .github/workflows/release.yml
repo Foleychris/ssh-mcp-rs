@@ -1,23 +1,36 @@
-# Publish to crates.io when a version tag (vX.Y.Z) is pushed, using crates.io
-# Trusted Publishing: GitHub's OIDC token is exchanged for a 30-minute
-# crates.io token, so no API token is stored anywhere.
+# Publish to crates.io with Trusted Publishing: GitHub's OIDC token is
+# exchanged for a 30-minute crates.io token, so no API token is stored.
 #
 # crates.io side (crate Settings -> Trusted Publishing -> Add -> GitHub):
 #   owner Foleychris, repository ssh-mcp-rs, workflow release.yml,
 #   environment release.
-# Release: bump `version` in Cargo.toml, commit, then
-#   git tag -a vX.Y.Z -m "sshmux-mcp X.Y.Z" && git push origin vX.Y.Z
+#
+# Two ways in:
+# - publish: push a vX.Y.Z tag matching Cargo.toml's version (manual releases):
+#     git tag -a vX.Y.Z -m "sshmux-mcp X.Y.Z" && git push origin vX.Y.Z
+# - dependabot: weekly (Friday night Pacific, before the homelab's Saturday
+#   update installs the newest release) or by hand (Actions -> Release -> Run).
+#   Merges green Dependabot PRs that only touch Cargo.lock, and if Dependabot
+#   updates are the only crate changes since the last tag, bumps the patch
+#   version, tags it and publishes. See .github/scripts/dependabot-release.sh.
+#   If its publish step fails after the tag was pushed, re-run by re-pushing
+#   the tag: git push origin :vX.Y.Z && git push origin vX.Y.Z
 name: Release
 on:
   push:
     tags: ['v*']
+  schedule:
+    - cron: '37 5 * * 6' # Sat 05:37 UTC = Fri 21:37 PST / 22:37 PDT
+  workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
 jobs:
   publish:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    # Add protection rules (e.g. required reviewers) to this environment in the
-    # repository settings to approve each publish by hand.
     environment: release
     permissions:
       contents: read
@@ -41,5 +54,63 @@ jobs:
       - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
       - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  dependabot:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write # merge PRs, push the version bump and tag
+      pull-requests: write
+      checks: read
+      statuses: read
+      id-token: write # OIDC token for the crates.io exchange
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SCRIPT: .github/scripts/dependabot-release.sh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0 # history and tags, to compare with the last release
+      - name: Merge green lockfile-only Dependabot PRs
+        run: bash "$SCRIPT" merge
+      - name: Update the checkout to what was merged
+        run: git pull -q --ff-only origin master && git fetch -q --tags origin
+      - name: Decide whether to release
+        id: decide
+        run: bash "$SCRIPT" decide >> "$GITHUB_OUTPUT"
+      - if: steps.decide.outputs.release == 'true'
+        run: rustup component add rustfmt clippy
+      - name: Bump the patch version
+        if: steps.decide.outputs.release == 'true'
+        id: bump
+        run: echo "version=$(bash "$SCRIPT" bump)" >> "$GITHUB_OUTPUT"
+      # The merged updates are re-checked together before anything is published.
+      - if: steps.decide.outputs.release == 'true'
+        run: cargo fmt --all -- --check
+      - if: steps.decide.outputs.release == 'true'
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+      - if: steps.decide.outputs.release == 'true'
+        run: cargo test --release --locked
+      - if: steps.decide.outputs.release == 'true'
+        run: cargo publish --locked --dry-run --allow-dirty
+      - name: Commit, tag and push the release
+        if: steps.decide.outputs.release == 'true'
+        env:
+          V: ${{ steps.bump.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qam "Release $V: Dependabot dependency updates"
+          git tag -a "v$V" -m "sshmux-mcp $V (Dependabot dependency updates)"
+          git push -q origin HEAD:master "v$V"
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        if: steps.decide.outputs.release == 'true'
+        id: auth
+      - if: steps.decide.outputs.release == 'true'
+        run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
