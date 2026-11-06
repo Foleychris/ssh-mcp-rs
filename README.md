@@ -116,7 +116,10 @@ The repository's `Dockerfile` builds a slim image that runs as UID 1000;
 else `["agent"]`.
 
 - **`agent`**: every identity ssh-agent holds (`SSH_AUTH_SOCK`), including OpenSSH
-  certificates. Keys that match the host's `IdentityFile` are offered first.
+  certificates. Keys that match the host's `IdentityFile` are offered first. Like `ssh`, it
+  first binds the agent connection to the SSH session (`session-bind@openssh.com`), so keys
+  added with destination constraints (`ssh-add -h`) work. Agents that don't support the
+  extension are used unbound.
 - **`key_file`**: the host's `IdentityFile`s from ssh_config, then `key_file`. A file's
   certificate (`cert_file`, `CertificateFile`, or `<key>-cert.pub`) is tried before the plain
   key, if it's currently valid and matches the key. A passphrase-protected key can't be used

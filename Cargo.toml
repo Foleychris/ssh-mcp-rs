@@ -9,7 +9,7 @@ repository = "https://github.com/foleychris/ssh-mcp-rs"
 readme = "README.md"
 keywords = ["mcp", "ssh", "llm", "agent", "claude"]
 categories = ["command-line-utilities", "network-programming"]
-include = ["/src", "/tests/stdio.rs", "/README.md", "/LICENSE"]
+include = ["/src", "/tests/stdio.rs", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [dependencies]
 anyhow = "1.0.104"
