@@ -9,7 +9,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
@@ -19,14 +19,14 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get install -y --no-install-recommends openssh-server openssh-client netcat-openbsd && sudo mkdir -p /run/sshd
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --locked --test auth --test proxy -- --ignored --test-threads=1
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.89 --profile minimal && rustup override set 1.89
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
