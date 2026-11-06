@@ -2,7 +2,7 @@
 
 All notable changes to sshmux-mcp. Versions follow [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.3.3 (2026-11-06)
 
 ### Fixed
 - `agent` auth now binds the agent connection to the SSH session with
