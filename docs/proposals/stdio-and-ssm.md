@@ -2,8 +2,15 @@
 
 Status: **approved for implementation, phases 0–3.** Phase 4 is design only;
 write up findings, don't build it. Phases 0–3 are done; phase 4 (the design
-doc) is next. Phase 3 still needs the owner's check against a real
-SSM-managed instance.
+doc) is next. Phase 3 was checked against a real SSM-managed instance on
+2026-11-06 (Amazon Linux 2023, Session Manager plugin 1.2.896,
+AWS-StartSSHSession): strict host keys under the instance ID, auth, 12
+concurrent commands multiplexed over one SSM session, 1 MiB binary file
+round trip, clean exit. The plugin writes a line to stdout before the SSH
+version string; russh skips such lines, as RFC 4253 requires. The test found
+two bugs, fixed in the same change: a proxy for a connection still being set
+up was orphaned when the stdio server exited, and quick-command tools timed
+out before the proxy could report why it failed.
 
 Phase 3 as built differs from or adds to the text below in these ways:
 - ssh_config `ProxyCommand` runs under `sh -c`, as OpenSSH runs it, with the
