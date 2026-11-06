@@ -265,3 +265,23 @@ fn values_that_could_inject_are_refused() {
     assert!(!marker.exists());
     assert!(!std::path::Path::new("pwned").exists());
 }
+
+#[test]
+#[ignore]
+fn exiting_mid_connect_leaves_no_proxy_behind() {
+    // Found against real AWS SSM: when the stdio client went away while a
+    // connection was still being set up, its proxy (session-manager-plugin)
+    // wasn't in the pool yet, and process::exit skipped its destructor.
+    let lab = lab_with_key("px-exit");
+    let cfg = cfg(
+        &lab,
+        "[hosts.slow]\naddress = \"slow.example\"\nconnect_timeout_secs = 60\n\
+         proxy_command = \"sh -c 'sleep 34; true'\"\n",
+    );
+    let mut s = Session::start(&lab, &cfg, false);
+    s.call(1, "test_ssh_connection", json!({"hostname": "slow"}));
+    wait_count("sleep 34", 1);
+    // Client goes away while the handshake is still pending.
+    s.close();
+    wait_count("sleep 34", 0);
+}

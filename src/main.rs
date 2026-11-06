@@ -168,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     // Stop proxy processes with their connections.
     app.pool.close_all();
+    crate::proxy::kill_all();
     Ok(())
 }
 

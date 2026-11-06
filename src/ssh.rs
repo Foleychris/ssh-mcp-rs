@@ -691,8 +691,24 @@ impl Pool {
         timeout: Duration,
         control: bool,
     ) -> Result<(Option<u32>, String, String)> {
+        // Setting up the connection gets at least the host's own connect
+        // timeout (plus a margin), so a slow or failing proxy reports its own
+        // diagnosis (exit status, stderr) instead of this generic timeout.
+        let setup = timeout.max(
+            Duration::from_secs(
+                t.connect_timeout_secs
+                    .unwrap_or(self.cfg.limits.connect_timeout_secs),
+            ) + Duration::from_secs(5),
+        );
+        let (_lease, mut ch) = tokio::time::timeout(setup, self.open_channel(t, control))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "timed out after {setup:?} waiting for a connection to {}",
+                    t.alias
+                )
+            })??;
         let fut = async {
-            let (_lease, mut ch) = self.open_channel(t, control).await?;
             ch.exec(true, cmd).await?;
             ch.eof().await?;
             let (mut out, mut err, mut code) = (Vec::new(), Vec::new(), None);

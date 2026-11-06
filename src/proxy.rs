@@ -11,11 +11,32 @@
 
 use crate::runs::sh_quote;
 use anyhow::{Context, Result, anyhow, bail};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
+
+/// Process groups of proxies that are still alive (one per connection or
+/// connection attempt), so [`kill_all`] can stop them when the server exits
+/// without running destructors (`std::process::exit` in stdio mode). Without
+/// it, a proxy for a connection still being set up would be orphaned.
+static LIVE: Mutex<BTreeSet<i32>> = Mutex::new(BTreeSet::new());
+
+/// SIGTERM every live proxy's process group. Call just before exiting.
+pub fn kill_all() -> usize {
+    let groups: Vec<i32> = std::mem::take(&mut *LIVE.lock().unwrap_or_else(|p| p.into_inner()))
+        .into_iter()
+        .collect();
+    for pg in &groups {
+        // SAFETY: kill(2) on a process group this process created for a proxy
+        // that hasn't been dropped (dropping removes it from LIVE).
+        unsafe {
+            libc::kill(-pg, libc::SIGTERM);
+        }
+    }
+    groups.len()
+}
 
 /// Bytes of the proxy's stderr kept for error messages.
 const STDERR_TAIL: usize = 4096;
@@ -197,6 +218,9 @@ impl ProxyChild {
 
 impl Drop for ProxyChild {
     fn drop(&mut self) {
+        if let Some(pg) = self.pgid {
+            LIVE.lock().unwrap_or_else(|p| p.into_inner()).remove(&pg);
+        }
         if let Some(pg) = self.pgid
             && pg > 1
             && self.child.try_wait().ok().flatten().is_none()
@@ -245,6 +269,9 @@ pub fn spawn(
         }
     });
     let pgid = child.id().map(|p| p as i32);
+    if let Some(pg) = pgid.filter(|pg| *pg > 1) {
+        LIVE.lock().unwrap_or_else(|p| p.into_inner()).insert(pg);
+    }
     Ok((
         tokio::io::join(stdout, stdin),
         ProxyChild {
@@ -403,6 +430,29 @@ mod tests {
             "aws"
         );
         assert_eq!(spec("whatever", true).program(), "sh -c");
+    }
+
+    #[tokio::test]
+    async fn kill_all_stops_proxies_whose_destructor_never_runs() {
+        // A proxy that starts a child of its own, like aws -> session-manager-plugin.
+        let marker = format!("sleep 41{}", std::process::id() % 1000);
+        let (io, child) =
+            spawn(&["/bin/sh".into(), "-c".into(), format!("{marker} & wait")]).unwrap();
+        let count = || {
+            let o = std::process::Command::new("pgrep")
+                .args(["-fx", &marker])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).lines().count()
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(count(), 1);
+        // What std::process::exit does: no destructors.
+        std::mem::forget(child);
+        std::mem::forget(io);
+        assert!(kill_all() >= 1);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(count(), 0, "the proxy's process group should be gone");
     }
 
     #[tokio::test]

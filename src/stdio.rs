@@ -60,6 +60,8 @@ pub async fn serve(app: Arc<AppState>) -> anyhow::Result<()> {
     // process::exit skips destructors: close connections (and stop proxy
     // processes) explicitly.
     app.pool.close_all();
+    // Proxies of connections still being set up aren't in the pool.
+    crate::proxy::kill_all();
     // tokio's stdin reader is a blocking thread that can't be interrupted; it
     // would keep the runtime alive after a signal. Everything is flushed now.
     std::process::exit(0);
